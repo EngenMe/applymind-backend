@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SqlDialectMappings">
+    <file url="file://$PROJECT_DIR$/migrations/000001_extensions_and_enums.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000001_extensions_and_enums.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000002_create_sites.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000002_create_sites.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000003_create_cvs.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000003_create_cvs.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000004_create_cv_versions.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000004_create_cv_versions.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000005_create_applications.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000005_create_applications.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000006_create_cover_letters.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000006_create_cover_letters.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000007_create_application_status_history.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000007_create_application_status_history.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000008_create_follow_up_reminders.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000008_create_follow_up_reminders.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000009_create_recruiter_contacts.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000009_create_recruiter_contacts.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000010_seed_sites.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000010_seed_sites.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/queries/sites.sql" dialect="PostgreSQL" />
+  </component>
+</project>

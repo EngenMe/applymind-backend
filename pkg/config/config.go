@@ -16,6 +16,9 @@ type Config struct {
 	APIKey          string
 	Port            string
 
+	// CVBucket is the S3 bucket the cvs module stores uploaded files in.
+	CVBucket string
+
 	// CORSAllowedOrigins is the browser origin allow-list. Per the
 	// architecture diagram this is the Vercel dashboard domain plus the
 	// chrome-extension:// origin. Comma-separated in the env var.
@@ -30,6 +33,7 @@ func Load() (*Config, error) {
 		NeonDatabaseURL: os.Getenv("NEON_DATABASE_URL"),
 		APIKey:          os.Getenv("APPLYMIND_API_KEY"),
 		Port:            os.Getenv("PORT"),
+		CVBucket:        os.Getenv("APPLYMIND_CV_BUCKET"),
 	}
 
 	var missing []string
@@ -38,6 +42,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.APIKey == "" {
 		missing = append(missing, "APPLYMIND_API_KEY")
+	}
+	if cfg.CVBucket == "" {
+		missing = append(missing, "APPLYMIND_CV_BUCKET")
 	}
 
 	if len(missing) > 0 {

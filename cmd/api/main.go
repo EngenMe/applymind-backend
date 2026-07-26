@@ -5,8 +5,7 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 1 wires the router, middleware and database pool only. No module
-// routes are registered yet.
+// Phase 2 adds the cvs module's routes.
 package main
 
 import (
@@ -28,9 +27,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"github.com/EngenMe/applymind-backend/internal/cvs"
+	sqlcdb "github.com/EngenMe/applymind-backend/inte
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
 	"github.com/EngenMe/applymind-backend/pkg/middleware"
+	"github.com/EngenMe/applymind-backend/pkg/storage"
 )
 
 var chiLambda *chiadapter.ChiLambda
@@ -63,7 +65,15 @@ func main() {
 	}
 	defer pool.Close()
 
-	router := newRouter(cfg, pool)
+	// S3 client for the cvs module. Uses the ambient AWS config — an IAM role
+	// under Lambda, or ~/.aws/credentials / env vars locally.
+	cvStore, err := storage.NewS3Client(ctx, cfg.CVBucket)
+	if err != nil {
+		slog.Error("failed to create s3 client", "error", err)
+		os.Exit(1)
+	}
+
+	router := newRouter(cfg, pool, cvStore, logger)
 
 	if isLambda() {
 		slog.Info("starting in lambda mode")
@@ -85,7 +95,7 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 	return chiLambda.ProxyWithContext(ctx, req)
 }
 
-func newRouter(cfg *config.Config, pool *pgxpool.Pool) *chi.Mux {
+func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, logger *slog.Logger) *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
@@ -110,12 +120,14 @@ func newRouter(cfg *config.Config, pool *pgxpool.Pool) *chi.Mux {
 	// need to hold a credential.
 	r.Get("/health", healthHandler(pool))
 
+	queries := sqlcdb.New(pool)
+
 	r.Group(
 		func(protected chi.Router) {
 			protected.Use(middleware.APIKeyAuth(cfg.APIKey))
 
-			// Phase 1: no module routes registered yet. Each module will expose a
-			// RegisterRoutes(protected) call here as it is built.
+			cvSvc := cvs.NewService(cvs.NewRepository(queries), cvStore)
+			cvs.NewHandler(cvSvc, logger).RegisterRoutes(protected)
 		},
 	)
 

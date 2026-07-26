@@ -62,6 +62,18 @@ type Querier interface {
 	FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersionByCVAndHashParams) (CvVersion, error)
 	FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersionByCVAndSizeParams) (CvVersion, error)
 	FindCVVersionByHash(ctx context.Context, sha256Hash string) (CvVersion, error)
+	// Queries for the notifications module. Reminder *creation* and *dismissal* stay
+	// in queries/applications.sql: they happen during a save or a status change,
+	// inside that module's transaction.
+	// FindDueFollowUpReminders is flow 4 steps 3 and 5 collapsed into one round
+	// trip: the due reminders plus the application data needed to describe each one.
+	//
+	// Dismissed reminders are always excluded. @include_sent = false is the sweep
+	// (flow 4's sent_at IS NULL, which makes a second run on the same day a no-op);
+	// true is the dashboard poll, which still wants a reminder the sweep already
+	// dispatched this morning.
+	//
+	FindDueFollowUpReminders(ctx context.Context, arg FindDueFollowUpRemindersParams) ([]FindDueFollowUpRemindersRow, error)
 	FindLatestCVVersionByFilename(ctx context.Context, originalFilename string) (CvVersion, error)
 	GetApplication(ctx context.Context, id uuid.UUID) (Application, error)
 	GetCV(ctx context.Context, id uuid.UUID) (Cv, error)
@@ -87,6 +99,14 @@ type Querier interface {
 	// show the deactivated ones in order to switch them back on.
 	ListSites(ctx context.Context) ([]Site, error)
 	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error)
+	// MarkFollowUpReminderSent is flow 4 step 9, minus the resend_email_id
+	// assignment: no such column exists in migration 000008 or the ERD, and no
+	// email is sent in the MVP.
+	//
+	// The sent_at IS NULL guard makes this idempotent — a concurrent or repeated
+	// run updates nothing and returns no row rather than moving the timestamp.
+	//
+	MarkFollowUpReminderSent(ctx context.Context, arg MarkFollowUpReminderSentParams) (FollowUpReminder, error)
 	// Turns a job URL host into a site_id when the client did not send one.
 	// NOTE: if queries/sites.sql already defines an equivalent lookup, delete this
 	// one and point the repository at that generated method instead — two queries

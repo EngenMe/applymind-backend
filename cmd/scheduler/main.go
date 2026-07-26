@@ -6,8 +6,11 @@
 //   - Locally it executes run() exactly once and exits, so a scheduled pass
 //     can be exercised on demand without waiting for the cron.
 //
-// Phase 1 establishes the entry point and its dependencies only. The reminder
-// sweep itself belongs to the notifications module in a later phase.
+// Phase 6 wires the sweep itself: one invocation is one call to
+// notifications.Service.CheckReminders — flow 4 phases 2 to 4. Delivery goes
+// through the module's Notifier port, which in the MVP writes a structured log
+// line; the user-visible browser notification is raised by the dashboard from
+// GET /notifications/due.
 package main
 
 import (
@@ -20,18 +23,27 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
+	"github.com/EngenMe/applymind-backend/internal/notifications"
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
 )
 
-var pool *pgxpool.Pool
+var (
+	pool     *pgxpool.Pool
+	notifSvc notifications.Service
+)
 
 func main() {
 	_ = godotenv.Load()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logger := slog.New(
+		slog.NewJSONHandler(
+			os.Stdout, &slog.HandlerOptions{
+				Level: slog.LevelInfo,
+			},
+		),
+	)
 	slog.SetDefault(logger)
 
 	cfg, err := config.Load()
@@ -48,6 +60,15 @@ func main() {
 	}
 	defer pool.Close()
 
+	// The sweep never opens a transaction of its own — each reminder is stamped
+	// independently, so one failure cannot roll back the reminders before it —
+	// so the repository takes only the queries, not the pool.
+	notifSvc = notifications.NewService(
+		notifications.NewRepository(sqlcdb.New(pool)),
+		notifications.WithNotifier(notifications.NewLogNotifier(logger)),
+		notifications.WithLogger(logger),
+	)
+
 	if isLambda() {
 		slog.Info("starting scheduler in lambda mode")
 		lambda.Start(handler)
@@ -59,7 +80,6 @@ func main() {
 		slog.Error("scheduler run failed", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("scheduler run complete")
 }
 
 func isLambda() bool {
@@ -71,15 +91,29 @@ func handler(ctx context.Context, event events.CloudWatchEvent) error {
 	return run(ctx)
 }
 
-// run performs one reminder sweep.
+// run performs one reminder sweep — flow 4 steps 2 to 12.
 //
-// Phase 1 intentionally does nothing beyond proving the entry point boots and
-// the database is reachable. The actual query for due reminders and the Resend
-// delivery call are out of scope for this phase.
+// An error here fails the invocation, which is what makes EventBridge's retry
+// meaningful: the sweep could not read the due list, so nothing was raised.
+// Per-reminder failures are handled inside the service and reported in the
+// summary rather than failing the run, because the reminders that did go out
+// should not be repeated tomorrow just because one of their neighbours failed.
 func run(ctx context.Context) error {
-	if err := pool.Ping(ctx); err != nil {
+	slog.InfoContext(ctx, "scheduler invoked, starting follow-up reminder check")
+
+	summary, err := notifSvc.CheckReminders(ctx)
+	if err != nil {
 		return err
 	}
-	slog.Info("scheduler: no work implemented in phase 1")
+
+	// Flow 4 step 12: the run summary as structured JSON.
+	slog.InfoContext(
+		ctx, "scheduler complete",
+		slog.String("event", "scheduler_complete"),
+		slog.Int("due_count", summary.DueCount),
+		slog.Int("sent_count", summary.SentCount),
+		slog.Int("failed_count", summary.FailedCount),
+		slog.Int64("duration_ms", summary.Duration.Milliseconds()),
+	)
 	return nil
 }

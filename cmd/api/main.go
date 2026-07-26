@@ -5,7 +5,8 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 5 adds the sites module's routes and startup seeding.
+// Phase 6 adds the notifications module's read endpoint, which is how the
+// dashboard learns what to raise a browser notification about.
 package main
 
 import (
@@ -31,6 +32,7 @@ import (
 	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"github.com/EngenMe/applymind-backend/internal/cvs"
 	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
+	"github.com/EngenMe/applymind-backend/internal/notifications"
 	"github.com/EngenMe/applymind-backend/internal/sites"
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
@@ -167,6 +169,17 @@ func newRouter(
 			// before the router ever serves a request; here it is only wired to
 			// its routes.
 			sites.NewHandler(siteSvc, logger).RegisterRoutes(protected)
+
+			// notifications is the same service the scheduler runs, but Lambda 1
+			// only reads through it: GET /notifications/due tells the dashboard
+			// what to raise a browser notification about. It is constructed
+			// without a Notifier because nothing on this path dispatches — the
+			// default LogNotifier is never reached from ListDue.
+			notifSvc := notifications.NewService(
+				notifications.NewRepository(queries),
+				notifications.WithLogger(logger),
+			)
+			notifications.NewHandler(notifSvc, logger).RegisterRoutes(protected)
 		},
 	)
 

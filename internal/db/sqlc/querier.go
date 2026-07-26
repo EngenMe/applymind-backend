@@ -17,7 +17,18 @@ type Querier interface {
 	// generated enum type from the applications module.
 	CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error)
 	CreateCVVersion(ctx context.Context, arg CreateCVVersionParams) (CvVersion, error)
+	// Queries for the coverletters module.
+	//
+	// cover_letters is one-to-one with applications (unique(application_id)), so
+	// every statement here is keyed by application_id rather than by the row's own
+	// id. There is no history table and nothing to match against.
+	// The id is supplied by the service rather than defaulted, because a file
+	// cover letter's S3 key is derived from it before the row is written.
+	CreateCoverLetter(ctx context.Context, arg CreateCoverLetterParams) (CoverLetter, error)
 	DeleteCV(ctx context.Context, id uuid.UUID) error
+	// Used to implement replace-on-save. Deleting a row that is not there is a
+	// no-op, which is what the service relies on.
+	DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error
 	FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersionByCVAndHashParams) (CvVersion, error)
 	FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersionByCVAndSizeParams) (CvVersion, error)
 	FindCVVersionByHash(ctx context.Context, sha256Hash string) (CvVersion, error)
@@ -25,6 +36,7 @@ type Querier interface {
 	GetCV(ctx context.Context, id uuid.UUID) (Cv, error)
 	GetCVByName(ctx context.Context, name string) (Cv, error)
 	GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error)
+	GetCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) (CoverLetter, error)
 	GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCVUsageRow, error)
 	// Resolves a captured page's domain to a site row. Returns pgx.ErrNoRows when
 	// the domain is not a configured site.
@@ -35,6 +47,10 @@ type Querier interface {
 	ListApplicationsUsingCVVersion(ctx context.Context, cvVersionID *uuid.UUID) ([]ListApplicationsUsingCVVersionRow, error)
 	ListCVs(ctx context.Context) ([]Cv, error)
 	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error)
+	// Scoped to kind = 'text'. A file cover letter records the bytes that were
+	// actually sent and is immutable; without this predicate the row-level check
+	// constraint would reject the write anyway, but with a far less useful error.
+	UpdateCoverLetterText(ctx context.Context, arg UpdateCoverLetterTextParams) (CoverLetter, error)
 }
 
 var _ Querier = (*Queries)(nil)

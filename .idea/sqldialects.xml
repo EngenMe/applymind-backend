@@ -21,6 +21,7 @@
     <file url="file://$PROJECT_DIR$/migrations/000009_create_recruiter_contacts.up.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/migrations/000010_seed_sites.down.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/migrations/000010_seed_sites.up.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/queries/cover_letters.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/queries/sites.sql" dialect="PostgreSQL" />
   </component>
 </project>

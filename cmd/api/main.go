@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,7 +29,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/EngenMe/applymind-backend/internal/cvs"
-	sqlcdb "github.com/EngenMe/applymind-backend/inte
+	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
 	"github.com/EngenMe/applymind-backend/pkg/middleware"
@@ -128,6 +129,9 @@ func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, l
 
 			cvSvc := cvs.NewService(cvs.NewRepository(queries), cvStore)
 			cvs.NewHandler(cvSvc, logger).RegisterRoutes(protected)
+
+			clSvc := coverletters.NewService(coverletters.NewRepository(queries), cvStore)
+			coverletters.NewHandler(clSvc, logger).RegisterRoutes(protected)
 		},
 	)
 

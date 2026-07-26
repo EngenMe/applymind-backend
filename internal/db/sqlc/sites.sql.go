@@ -7,7 +7,122 @@ package db
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
+
+const createSite = `-- name: CreateSite :one
+INSERT INTO sites (name, domain, is_preconfigured, is_active)
+VALUES ($1, $2, $3, $4)
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+`
+
+type CreateSiteParams struct {
+	Name            string `json:"name"`
+	Domain          string `json:"domain"`
+	IsPreconfigured bool   `json:"is_preconfigured"`
+	IsActive        bool   `json:"is_active"`
+}
+
+// id, created_at and updated_at come from column defaults.
+func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (Site, error) {
+	row := q.db.QueryRow(ctx, createSite,
+		arg.Name,
+		arg.Domain,
+		arg.IsPreconfigured,
+		arg.IsActive,
+	)
+	var i Site
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Domain,
+		&i.IsPreconfigured,
+		&i.IsActive,
+		&i.Selectors,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const deleteSite = `-- name: DeleteSite :execrows
+DELETE FROM sites
+WHERE id = $1
+`
+
+// Fails with 23503 when applications still reference the site: the foreign key
+// is ON DELETE RESTRICT. The pre-configured rule is enforced in the service
+// layer, not here, per the ERD.
+func (q *Queries) DeleteSite(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSite, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const ensureSite = `-- name: EnsureSite :one
+INSERT INTO sites (name, domain, is_preconfigured, is_active)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (domain) DO NOTHING
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+`
+
+type EnsureSiteParams struct {
+	Name            string `json:"name"`
+	Domain          string `json:"domain"`
+	IsPreconfigured bool   `json:"is_preconfigured"`
+	IsActive        bool   `json:"is_active"`
+}
+
+// Idempotent insert used to seed the pre-configured list on boot. DO NOTHING
+// means no row is returned when the domain is already registered, which the
+// repository reads as "nothing to do" rather than an error.
+//
+// Note this only guards the domain constraint; name is UNIQUE too, and a
+// collision there surfaces as 23505.
+func (q *Queries) EnsureSite(ctx context.Context, arg EnsureSiteParams) (Site, error) {
+	row := q.db.QueryRow(ctx, ensureSite,
+		arg.Name,
+		arg.Domain,
+		arg.IsPreconfigured,
+		arg.IsActive,
+	)
+	var i Site
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Domain,
+		&i.IsPreconfigured,
+		&i.IsActive,
+		&i.Selectors,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getSite = `-- name: GetSite :one
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+WHERE id = $1
+`
+
+func (q *Queries) GetSite(ctx context.Context, id uuid.UUID) (Site, error) {
+	row := q.db.QueryRow(ctx, getSite, id)
+	var i Site
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Domain,
+		&i.IsPreconfigured,
+		&i.IsActive,
+		&i.Selectors,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
 
 const getSiteByDomain = `-- name: GetSiteByDomain :one
 SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
@@ -66,4 +181,69 @@ func (q *Queries) ListActiveSites(ctx context.Context) ([]Site, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const listSites = `-- name: ListSites :many
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+ORDER BY name
+`
+
+// Every site, active or not. Backs the dashboard settings page, which has to
+// show the deactivated ones in order to switch them back on.
+func (q *Queries) ListSites(ctx context.Context) ([]Site, error) {
+	rows, err := q.db.Query(ctx, listSites)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Site{}
+	for rows.Next() {
+		var i Site
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Domain,
+			&i.IsPreconfigured,
+			&i.IsActive,
+			&i.Selectors,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setSiteActive = `-- name: SetSiteActive :one
+UPDATE sites
+SET is_active = $2
+WHERE id = $1
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+`
+
+type SetSiteActiveParams struct {
+	ID       uuid.UUID `json:"id"`
+	IsActive bool      `json:"is_active"`
+}
+
+// updated_at is maintained by trg_sites_updated_at.
+func (q *Queries) SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (Site, error) {
+	row := q.db.QueryRow(ctx, setSiteActive, arg.ID, arg.IsActive)
+	var i Site
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Domain,
+		&i.IsPreconfigured,
+		&i.IsActive,
+		&i.Selectors,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

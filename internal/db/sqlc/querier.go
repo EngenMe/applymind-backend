@@ -33,6 +33,8 @@ type Querier interface {
 	// uq_follow_up_reminders_one_pending allows a single un-sent, un-dismissed
 	// reminder per application, so a re-save is a no-op rather than an error.
 	CreatePendingFollowUpReminder(ctx context.Context, arg CreatePendingFollowUpReminderParams) (FollowUpReminder, error)
+	// id, created_at and updated_at come from column defaults.
+	CreateSite(ctx context.Context, arg CreateSiteParams) (Site, error)
 	// Cover letters, status history, reminders and recruiter contacts go with it via
 	// ON DELETE CASCADE.
 	DeleteApplication(ctx context.Context, id uuid.UUID) (int64, error)
@@ -40,9 +42,20 @@ type Querier interface {
 	// Used to implement replace-on-save. Deleting a row that is not there is a
 	// no-op, which is what the service relies on.
 	DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error
+	// Fails with 23503 when applications still reference the site: the foreign key
+	// is ON DELETE RESTRICT. The pre-configured rule is enforced in the service
+	// layer, not here, per the ERD.
+	DeleteSite(ctx context.Context, id uuid.UUID) (int64, error)
 	// Called when an application moves off Applied: the company (or the user) has
 	// moved it on, so there is nothing left to chase.
 	DismissPendingFollowUpReminders(ctx context.Context, applicationID uuid.UUID) error
+	// Idempotent insert used to seed the pre-configured list on boot. DO NOTHING
+	// means no row is returned when the domain is already registered, which the
+	// repository reads as "nothing to do" rather than an error.
+	//
+	// Note this only guards the domain constraint; name is UNIQUE too, and a
+	// collision there surfaces as 23505.
+	EnsureSite(ctx context.Context, arg EnsureSiteParams) (Site, error)
 	// The MVP duplicate check: exact company name, ignoring case and surrounding
 	// whitespace. Embedding similarity is a later phase.
 	FindApplicationsByCompanyName(ctx context.Context, companyName string) ([]Application, error)
@@ -56,6 +69,7 @@ type Querier interface {
 	GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error)
 	GetCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) (CoverLetter, error)
 	GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCVUsageRow, error)
+	GetSite(ctx context.Context, id uuid.UUID) (Site, error)
 	// Resolves a captured page's domain to a site row. Returns pgx.ErrNoRows when
 	// the domain is not a configured site.
 	GetSiteByDomain(ctx context.Context, domain string) (Site, error)
@@ -69,6 +83,9 @@ type Querier interface {
 	ListApplications(ctx context.Context, arg ListApplicationsParams) ([]Application, error)
 	ListApplicationsUsingCVVersion(ctx context.Context, cvVersionID *uuid.UUID) ([]ListApplicationsUsingCVVersionRow, error)
 	ListCVs(ctx context.Context) ([]Cv, error)
+	// Every site, active or not. Backs the dashboard settings page, which has to
+	// show the deactivated ones in order to switch them back on.
+	ListSites(ctx context.Context) ([]Site, error)
 	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error)
 	// Turns a job URL host into a site_id when the client did not send one.
 	// NOTE: if queries/sites.sql already defines an equivalent lookup, delete this
@@ -78,6 +95,8 @@ type Querier interface {
 	// The service passes a lowercased, www-stripped host, so the stored value is
 	// normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
 	ResolveSiteByDomain(ctx context.Context, domain string) (Site, error)
+	// updated_at is maintained by trg_sites_updated_at.
+	SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (Site, error)
 	// Captured job data only. Status never moves here — that is
 	// UpdateApplicationStatus, so no transition can skip the audit trail.
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (Application, error)

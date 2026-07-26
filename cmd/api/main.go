@@ -5,7 +5,7 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 4 adds the applications module's routes.
+// Phase 5 adds the sites module's routes and startup seeding.
 package main
 
 import (
@@ -31,6 +31,7 @@ import (
 	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"github.com/EngenMe/applymind-backend/internal/cvs"
 	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
+	"github.com/EngenMe/applymind-backend/internal/sites"
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
 	"github.com/EngenMe/applymind-backend/pkg/middleware"
@@ -75,7 +76,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	router := newRouter(cfg, pool, cvStore, logger)
+	queries := sqlcdb.New(pool)
+
+	// Seed the pre-configured site list before the router serves a single
+	// request. Ensure-based, so this is safe to run on every cold start: rows
+	// already present (LinkedIn, from migration 000010) are left untouched, and
+	// only what is missing gets inserted. A failure here means the dashboard
+	// settings page and site resolution would come up incomplete, so it is
+	// fatal rather than logged-and-ignored.
+	siteSvc := sites.NewService(sites.NewRepository(queries))
+	if created, err := siteSvc.SeedPreconfigured(ctx); err != nil {
+		slog.Error("failed to seed pre-configured sites", "error", err)
+		os.Exit(1)
+	} else if created > 0 {
+		slog.Info("seeded pre-configured sites", "created", created)
+	}
+
+	router := newRouter(cfg, pool, queries, cvStore, siteSvc, logger)
 
 	if isLambda() {
 		slog.Info("starting in lambda mode")
@@ -97,7 +114,14 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 	return chiLambda.ProxyWithContext(ctx, req)
 }
 
-func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, logger *slog.Logger) *chi.Mux {
+func newRouter(
+	cfg *config.Config,
+	pool *pgxpool.Pool,
+	queries *sqlcdb.Queries,
+	cvStore storage.Client,
+	siteSvc sites.Service,
+	logger *slog.Logger,
+) *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
@@ -122,8 +146,6 @@ func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, l
 	// need to hold a credential.
 	r.Get("/health", healthHandler(pool))
 
-	queries := sqlcdb.New(pool)
-
 	r.Group(
 		func(protected chi.Router) {
 			protected.Use(middleware.APIKeyAuth(cfg.APIKey))
@@ -140,6 +162,11 @@ func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, l
 			// together or not at all.
 			appSvc := applications.NewService(applications.NewRepository(pool, queries), clSvc)
 			applications.NewHandler(appSvc, logger).RegisterRoutes(protected)
+
+			// siteSvc is built in main() so it can seed the pre-configured list
+			// before the router ever serves a request; here it is only wired to
+			// its routes.
+			sites.NewHandler(siteSvc, logger).RegisterRoutes(protected)
 		},
 	)
 

@@ -11,6 +11,11 @@ import (
 )
 
 type Querier interface {
+	// Queries for the applications module. Run `sqlc generate` after adding this
+	// file; internal/db/sqlc/applications.sql.go and the additions to querier.go are
+	// generated from it.
+	CreateApplication(ctx context.Context, arg CreateApplicationParams) (Application, error)
+	CreateApplicationStatusHistory(ctx context.Context, arg CreateApplicationStatusHistoryParams) (ApplicationStatusHistory, error)
 	// ApplyMind — cvs module queries
 	//
 	// Note: application status is cast to text so this module does not depend on the
@@ -25,14 +30,27 @@ type Querier interface {
 	// The id is supplied by the service rather than defaulted, because a file
 	// cover letter's S3 key is derived from it before the row is written.
 	CreateCoverLetter(ctx context.Context, arg CreateCoverLetterParams) (CoverLetter, error)
+	// uq_follow_up_reminders_one_pending allows a single un-sent, un-dismissed
+	// reminder per application, so a re-save is a no-op rather than an error.
+	CreatePendingFollowUpReminder(ctx context.Context, arg CreatePendingFollowUpReminderParams) (FollowUpReminder, error)
+	// Cover letters, status history, reminders and recruiter contacts go with it via
+	// ON DELETE CASCADE.
+	DeleteApplication(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCV(ctx context.Context, id uuid.UUID) error
 	// Used to implement replace-on-save. Deleting a row that is not there is a
 	// no-op, which is what the service relies on.
 	DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error
+	// Called when an application moves off Applied: the company (or the user) has
+	// moved it on, so there is nothing left to chase.
+	DismissPendingFollowUpReminders(ctx context.Context, applicationID uuid.UUID) error
+	// The MVP duplicate check: exact company name, ignoring case and surrounding
+	// whitespace. Embedding similarity is a later phase.
+	FindApplicationsByCompanyName(ctx context.Context, companyName string) ([]Application, error)
 	FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersionByCVAndHashParams) (CvVersion, error)
 	FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersionByCVAndSizeParams) (CvVersion, error)
 	FindCVVersionByHash(ctx context.Context, sha256Hash string) (CvVersion, error)
 	FindLatestCVVersionByFilename(ctx context.Context, originalFilename string) (CvVersion, error)
+	GetApplication(ctx context.Context, id uuid.UUID) (Application, error)
 	GetCV(ctx context.Context, id uuid.UUID) (Cv, error)
 	GetCVByName(ctx context.Context, name string) (Cv, error)
 	GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error)
@@ -44,9 +62,29 @@ type Querier interface {
 	// Returns every site the extension is currently allowed to capture from.
 	ListActiveSites(ctx context.Context) ([]Site, error)
 	ListAllCVVersions(ctx context.Context) ([]CvVersion, error)
+	ListApplicationStatusHistory(ctx context.Context, applicationID uuid.UUID) ([]ApplicationStatusHistory, error)
+	// Every filter is optional: a NULL parameter disables that clause. Ordering and
+	// date filtering both use the effective date — applied_at when set, created_at
+	// otherwise — so a Saved application is never invisible to a date range.
+	ListApplications(ctx context.Context, arg ListApplicationsParams) ([]Application, error)
 	ListApplicationsUsingCVVersion(ctx context.Context, cvVersionID *uuid.UUID) ([]ListApplicationsUsingCVVersionRow, error)
 	ListCVs(ctx context.Context) ([]Cv, error)
 	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error)
+	// Turns a job URL host into a site_id when the client did not send one.
+	// NOTE: if queries/sites.sql already defines an equivalent lookup, delete this
+	// one and point the repository at that generated method instead — two queries
+	// with the same name in the same package will not compile.
+	//
+	// The service passes a lowercased, www-stripped host, so the stored value is
+	// normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
+	ResolveSiteByDomain(ctx context.Context, domain string) (Site, error)
+	// Captured job data only. Status never moves here — that is
+	// UpdateApplicationStatus, so no transition can skip the audit trail.
+	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (Application, error)
+	// applied_at is write-once: COALESCE keeps the original timestamp if the
+	// application has already been applied to, so bouncing through statuses later
+	// never rewrites when it was actually sent.
+	UpdateApplicationStatus(ctx context.Context, arg UpdateApplicationStatusParams) (Application, error)
 	// Scoped to kind = 'text'. A file cover letter records the bytes that were
 	// actually sent and is immutable; without this predicate the row-level check
 	// constraint would reject the write anyway, but with a far less useful error.

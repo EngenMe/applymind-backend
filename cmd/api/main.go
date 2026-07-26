@@ -5,13 +5,12 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 2 adds the cvs module's routes.
+// Phase 4 adds the applications module's routes.
 package main
 
 import (
 	"context"
 	"errors"
-	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,6 +27,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"github.com/EngenMe/applymind-backend/internal/applications"
+	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"github.com/EngenMe/applymind-backend/internal/cvs"
 	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
 	"github.com/EngenMe/applymind-backend/pkg/config"
@@ -132,6 +133,13 @@ func newRouter(cfg *config.Config, pool *pgxpool.Pool, cvStore storage.Client, l
 
 			clSvc := coverletters.NewService(coverletters.NewRepository(queries), cvStore)
 			coverletters.NewHandler(clSvc, logger).RegisterRoutes(protected)
+
+			// applications takes the pool as well as the queries: it is the first
+			// module that opens transactions of its own, so that a save writes the
+			// application, its first status history row and its follow-up reminder
+			// together or not at all.
+			appSvc := applications.NewService(applications.NewRepository(pool, queries), clSvc)
+			applications.NewHandler(appSvc, logger).RegisterRoutes(protected)
 		},
 	)
 

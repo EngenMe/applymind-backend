@@ -5,8 +5,8 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 6 adds the notifications module's read endpoint, which is how the
-// dashboard learns what to raise a browser notification about.
+// Phase 7 adds the settings module and, when an OpenAI key is configured, the
+// GPT-4o-mini job-match score on application save.
 package main
 
 import (
@@ -33,7 +33,9 @@ import (
 	"github.com/EngenMe/applymind-backend/internal/cvs"
 	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
 	"github.com/EngenMe/applymind-backend/internal/notifications"
+	"github.com/EngenMe/applymind-backend/internal/settings"
 	"github.com/EngenMe/applymind-backend/internal/sites"
+	"github.com/EngenMe/applymind-backend/pkg/ai"
 	"github.com/EngenMe/applymind-backend/pkg/config"
 	"github.com/EngenMe/applymind-backend/pkg/database"
 	"github.com/EngenMe/applymind-backend/pkg/middleware"
@@ -94,7 +96,28 @@ func main() {
 		slog.Info("seeded pre-configured sites", "created", created)
 	}
 
-	router := newRouter(cfg, pool, queries, cvStore, siteSvc, logger)
+	// The OpenAI client is optional. Without a key the API behaves exactly as it
+	// did in phase 6: applications save, ai_score stays NULL. With a bad key it
+	// still starts — the failure surfaces per save, fail-soft, rather than
+	// taking the whole function down.
+	var scorer applications.Scorer
+	if cfg.AIScoringEnabled() {
+		client, err := ai.NewClient(
+			cfg.OpenAIAPIKey,
+			ai.WithModel(cfg.OpenAIModel),
+			ai.WithTimeout(cfg.AIScoreTimeout),
+		)
+		if err != nil {
+			slog.Error("failed to create openai client", "error", err)
+			os.Exit(1)
+		}
+		scorer = client
+		slog.Info("ai job scoring enabled", "model", client.Model(), "timeout", cfg.AIScoreTimeout)
+	} else {
+		slog.Warn("OPENAI_API_KEY is not set — applications will be saved without an ai match score")
+	}
+
+	router := newRouter(cfg, pool, queries, cvStore, siteSvc, scorer, logger)
 
 	if isLambda() {
 		slog.Info("starting in lambda mode")
@@ -122,6 +145,7 @@ func newRouter(
 	queries *sqlcdb.Queries,
 	cvStore storage.Client,
 	siteSvc sites.Service,
+	scorer applications.Scorer,
 	logger *slog.Logger,
 ) *chi.Mux {
 	r := chi.NewRouter()
@@ -158,11 +182,26 @@ func newRouter(
 			clSvc := coverletters.NewService(coverletters.NewRepository(queries), cvStore)
 			coverletters.NewHandler(clSvc, logger).RegisterRoutes(protected)
 
+			// settings owns the profile summary the AI score is calculated
+			// against, so it is built before applications and handed to it.
+			settingsSvc := settings.NewService(settings.NewRepository(queries))
+			settings.NewHandler(settingsSvc, logger).RegisterRoutes(protected)
+
 			// applications takes the pool as well as the queries: it is the first
 			// module that opens transactions of its own, so that a save writes the
 			// application, its first status history row and its follow-up reminder
 			// together or not at all.
-			appSvc := applications.NewService(applications.NewRepository(pool, queries), clSvc)
+			appOpts := []applications.ServiceOption{applications.WithLogger(logger)}
+			if scorer != nil {
+				// Scoring only turns on with both halves present: a model to ask
+				// and a profile to ask about.
+				appOpts = append(
+					appOpts,
+					applications.WithScoring(scorer, settingsSvc),
+					applications.WithScoreTimeout(cfg.AIScoreTimeout),
+				)
+			}
+			appSvc := applications.NewService(applications.NewRepository(pool, queries), clSvc, appOpts...)
 			applications.NewHandler(appSvc, logger).RegisterRoutes(protected)
 
 			// siteSvc is built in main() so it can seed the pre-configured list

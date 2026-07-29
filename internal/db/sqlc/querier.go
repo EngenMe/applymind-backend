@@ -81,6 +81,7 @@ type Querier interface {
 	GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error)
 	GetCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) (CoverLetter, error)
 	GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCVUsageRow, error)
+	GetSettings(ctx context.Context) (Setting, error)
 	GetSite(ctx context.Context, id uuid.UUID) (Site, error)
 	// Resolves a captured page's domain to a site row. Returns pgx.ErrNoRows when
 	// the domain is not a configured site.
@@ -115,6 +116,21 @@ type Querier interface {
 	// The service passes a lowercased, www-stripped host, so the stored value is
 	// normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
 	ResolveSiteByDomain(ctx context.Context, domain string) (Site, error)
+	// ---------------------------------------------------------------------------
+	// PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
+	//
+	// This file is not a queries file of its own -- it exists only because
+	// queries/applications.sql was not part of the phase upload. Delete it once the
+	// query has been moved across.
+	//
+	// If applications.sql keeps updated_at current with a trigger rather than in
+	// each statement, drop the `updated_at = now()` line to match the other writes
+	// in that file.
+	// ---------------------------------------------------------------------------
+	// Writes the GPT-4o-mini job-match score. Called inside the same transaction as
+	// CreateApplication (Flow 1 step 23), and available on its own as the retry path
+	// for an application saved while scoring was unavailable.
+	SetApplicationAIScore(ctx context.Context, arg SetApplicationAIScoreParams) (Application, error)
 	// updated_at is maintained by trg_sites_updated_at.
 	SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (Site, error)
 	// Captured job data only. Status never moves here — that is
@@ -128,6 +144,9 @@ type Querier interface {
 	// actually sent and is immutable; without this predicate the row-level check
 	// constraint would reject the write anyway, but with a far less useful error.
 	UpdateCoverLetterText(ctx context.Context, arg UpdateCoverLetterTextParams) (CoverLetter, error)
+	// Upsert rather than update: if the row seeded by migration 000011 is ever
+	// missing, the first write puts it back instead of failing forever.
+	UpsertProfileSummary(ctx context.Context, profileSummary *string) (Setting, error)
 }
 
 var _ Querier = (*Queries)(nil)

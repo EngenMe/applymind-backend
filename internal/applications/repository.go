@@ -39,6 +39,18 @@ type Repository interface {
 	// exact company match.
 	FindByCompanyName(ctx context.Context, company string) ([]Application, error)
 
+	// SetAIScore writes the GPT-4o-mini job-match score onto an application.
+	//
+	// It is a write of its own rather than columns on Create so that an
+	// application saved while scoring was unavailable can be scored later
+	// without a second insert path: ai_score is nullable for exactly that, and
+	// this is the method a retry would call. Create runs it inside its own
+	// transaction, so on the happy path the row is never visible unscored.
+	//
+	// explanation is a pointer because the model may return a number without
+	// prose; nil leaves ai_score_explanation NULL.
+	SetAIScore(ctx context.Context, id uuid.UUID, score float64, explanation *string) (*Application, error)
+
 	CreateStatusHistory(ctx context.Context, in NewStatusHistory) (*StatusHistory, error)
 	ListStatusHistory(ctx context.Context, applicationID uuid.UUID) ([]StatusHistory, error)
 
@@ -182,6 +194,29 @@ func (r *postgresRepository) UpdateStatus(
 			ID:        id,
 			Status:    sqlcdb.ApplicationStatus(status),
 			AppliedAt: appliedAt,
+		},
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, translateWriteError(err)
+	}
+	app := toDomain(row)
+	return &app, nil
+}
+
+func (r *postgresRepository) SetAIScore(
+	ctx context.Context,
+	id uuid.UUID,
+	score float64,
+	explanation *string,
+) (*Application, error) {
+	row, err := r.q.SetApplicationAIScore(
+		ctx, sqlcdb.SetApplicationAIScoreParams{
+			ID:                 id,
+			AiScore:            &score,
+			AiScoreExplanation: explanation,
 		},
 	)
 	if err != nil {

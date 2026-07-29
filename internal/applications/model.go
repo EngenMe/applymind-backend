@@ -80,8 +80,10 @@ func (c ChangeSource) Valid() bool {
 // been loaded; it is nil when the caller did not ask for it (same convention as
 // cvs.CV.Versions).
 //
-// AIScore and AIScoreExplanation are never written by this module — see the
-// extension point on service.Create.
+// AIScore and AIScoreExplanation hold the GPT-4o-mini job-match score. Both are
+// nullable and stay nil when scoring is switched off, when no profile summary
+// has been set, or when the model call failed — a save never depends on them.
+// They are written by Repository.SetAIScore, from service.Create.
 type Application struct {
 	ID                 uuid.UUID
 	CompanyName        string

@@ -3,6 +3,7 @@ package applications
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/EngenMe/applymind-backend/internal/coverletters"
+	"github.com/EngenMe/applymind-backend/pkg/ai"
 )
 
 // CoverLetters is the subset of the coverletters service this module needs.
@@ -18,6 +20,20 @@ import (
 // coverletters.Service satisfies it as written, so cmd/api wires it in directly.
 type CoverLetters interface {
 	SaveText(ctx context.Context, in coverletters.SaveTextInput) (*coverletters.CoverLetter, error)
+}
+
+// Scorer is the subset of the ai package this module needs. *ai.Client satisfies
+// it; tests supply a fake and never touch the network. Same precedent as
+// CoverLetters above.
+type Scorer interface {
+	ScoreJob(ctx context.Context, in ai.ScoreInput) (*ai.Score, error)
+}
+
+// ProfileSummaries reads the user's profile summary — the thing a job is scored
+// against. settings.Service satisfies it, so this module depends on one method
+// rather than on the settings module's whole surface.
+type ProfileSummaries interface {
+	ProfileSummary(ctx context.Context) (string, error)
 }
 
 // Service is the business logic boundary for the applications module.
@@ -49,6 +65,10 @@ const (
 	DefaultListLimit = 50
 	// MaxListLimit caps a caller-supplied page size.
 	MaxListLimit = 200
+	// DefaultScoreTimeout bounds the AI call inside a save. The flows budget
+	// ~1–3 seconds for it and the user watches a spinner the whole time, so this
+	// is a ceiling on how long the save can be held up, not an expected wait.
+	DefaultScoreTimeout = 15 * time.Second
 )
 
 // FollowUpDueAt is the follow-up rule in one place: a fixed delay after the
@@ -60,7 +80,11 @@ func FollowUpDueAt(appliedAt time.Time, delay time.Duration) time.Time {
 type service struct {
 	repo          Repository
 	coverLetters  CoverLetters
+	scorer        Scorer
+	profiles      ProfileSummaries
 	followUpDelay time.Duration
+	scoreTimeout  time.Duration
+	logger        *slog.Logger
 	now           func() time.Time // injectable for deterministic tests
 	newID         func() uuid.UUID // injectable for deterministic tests
 }
@@ -79,11 +103,43 @@ func WithIDGenerator(f func() uuid.UUID) ServiceOption {
 	return func(s *service) { s.newID = f }
 }
 
+func WithLogger(l *slog.Logger) ServiceOption {
+	return func(s *service) {
+		if l != nil {
+			s.logger = l
+		}
+	}
+}
+
+// WithScoring turns on AI job scoring. Both halves are required — a scorer with
+// nothing to score against is useless — so they are set together and scoring
+// stays off unless both arrive. Without this option the module behaves exactly
+// as it did before: applications save, ai_score stays NULL.
+func WithScoring(scorer Scorer, profiles ProfileSummaries) ServiceOption {
+	return func(s *service) {
+		if scorer != nil && profiles != nil {
+			s.scorer = scorer
+			s.profiles = profiles
+		}
+	}
+}
+
+// WithScoreTimeout caps how long a save will wait on the model.
+func WithScoreTimeout(d time.Duration) ServiceOption {
+	return func(s *service) {
+		if d > 0 {
+			s.scoreTimeout = d
+		}
+	}
+}
+
 func NewService(repo Repository, cl CoverLetters, opts ...ServiceOption) Service {
 	s := &service{
 		repo:          repo,
 		coverLetters:  cl,
 		followUpDelay: DefaultFollowUpDelay,
+		scoreTimeout:  DefaultScoreTimeout,
+		logger:        slog.Default(),
 		now:           time.Now,
 		newID:         uuid.New,
 	}
@@ -95,11 +151,12 @@ func NewService(repo Repository, cl CoverLetters, opts ...ServiceOption) Service
 
 // Create implements Flow 1, steps 17–24.
 //
-// The application, its first history row and its follow-up reminder are written
-// in one transaction. The cover letter is not: it belongs to the coverletters
-// module, which owns its own writes, and its foreign key means it cannot be
-// inserted before the application row is committed anyway. If saving it fails
-// the application is deleted again, so a half-saved application never survives.
+// The application, its first history row, its AI score and its follow-up
+// reminder are written in one transaction. The cover letter is not: it belongs
+// to the coverletters module, which owns its own writes, and its foreign key
+// means it cannot be inserted before the application row is committed anyway. If
+// saving it fails the application is deleted again, so a half-saved application
+// never survives.
 func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, error) {
 	company := strings.TrimSpace(in.CompanyName)
 	if company == "" {
@@ -149,10 +206,12 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 		dueAt = &due
 	}
 
-	// EXTENSION POINT (later phase): AI job scoring goes here, between the
-	// duplicate check and the write — Flow 1 steps 21–22. It is fail-soft: on an
-	// error or timeout, log it, leave ai_score NULL and carry on, because the
-	// save must succeed without it. The columns already exist on applications.
+	// Flow 1, steps 21–22. Deliberately outside the transaction below: this is a
+	// network call to a third party and holding a database transaction open
+	// across it would tie up a connection for seconds at a time. scoreJob never
+	// returns an error — every failure is logged and comes back as nil, leaving
+	// ai_score NULL and the save unaffected.
+	score := s.scoreJob(ctx, company, title, in.JobDescription)
 
 	var created *Application
 	err = s.repo.Tx(
@@ -172,6 +231,19 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 			)
 			if err != nil {
 				return err
+			}
+
+			// Flow 1 step 23: the score joins the same transaction as the row it
+			// belongs to, so an application is never briefly visible unscored
+			// when a score does exist. A failure here is a database failure, not
+			// an AI failure — the fail-soft branch is above — and it fails the
+			// save like any other write in this transaction would.
+			if score != nil {
+				scored, err := tx.SetAIScore(ctx, app.ID, score.Score, optionalString(score.Explanation))
+				if err != nil {
+					return err
+				}
+				app = scored
 			}
 
 			// First transition: nothing precedes it, so from_status is NULL.
@@ -275,6 +347,9 @@ func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Ap
 		return nil, err
 	}
 
+	// The job description can change here, which makes any existing score stale.
+	// Re-scoring on edit is deliberately not done: it is not in this phase's
+	// scope, and an edit is usually a typo fix rather than a new posting.
 	return s.repo.Update(
 		ctx, id, UpdateFields{
 			CompanyName:    company,
@@ -387,6 +462,73 @@ func (s *service) StatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHist
 		return nil, err
 	}
 	return s.repo.ListStatusHistory(ctx, id)
+}
+
+// ---------------------------------------------------------------------------
+// AI scoring
+// ---------------------------------------------------------------------------
+
+// scoreJob asks the model how well this job matches the user's profile.
+//
+// It returns nil rather than an error, on purpose: nothing that happens in here
+// is allowed to stop an application being saved. Every branch that gives up logs
+// why and leaves ai_score NULL, which the column is nullable to allow and which
+// SetAIScore can fill in later.
+//
+// Reasons it gives up, all of them normal:
+//   - scoring is not configured (no OpenAI key, so no scorer was wired in)
+//   - the user has not written a profile summary yet, so there is nothing to
+//     compare against and a score would be invented rather than judged
+//   - the job description was empty — external-site saves often start that way
+//   - the model errored, timed out, or answered with something unusable
+func (s *service) scoreJob(ctx context.Context, company, title, jobDescription string) *ai.Score {
+	if s.scorer == nil || s.profiles == nil {
+		return nil
+	}
+	if strings.TrimSpace(jobDescription) == "" {
+		s.logger.DebugContext(ctx, "applications: skipping ai score, no job description", slog.String("company", company))
+		return nil
+	}
+
+	summary, err := s.profiles.ProfileSummary(ctx)
+	if err != nil {
+		s.logger.WarnContext(
+			ctx, "applications: skipping ai score, could not read profile summary",
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	if strings.TrimSpace(summary) == "" {
+		s.logger.InfoContext(
+			ctx, "applications: skipping ai score, no profile summary set",
+			slog.String("hint", "PUT /settings/profile-summary"),
+		)
+		return nil
+	}
+
+	scoreCtx, cancel := context.WithTimeout(ctx, s.scoreTimeout)
+	defer cancel()
+
+	score, err := s.scorer.ScoreJob(
+		scoreCtx, ai.ScoreInput{
+			CompanyName:    company,
+			JobTitle:       title,
+			JobDescription: jobDescription,
+			ProfileSummary: summary,
+		},
+	)
+	if err != nil {
+		// Error, not warning: a save that silently loses its score is worth
+		// noticing in the logs, even though the user never sees it.
+		s.logger.ErrorContext(
+			ctx, "applications: ai scoring failed, saving without a score",
+			slog.String("company", company),
+			slog.String("job_title", title),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	return score
 }
 
 // ---------------------------------------------------------------------------

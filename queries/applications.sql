@@ -112,3 +112,26 @@ SELECT * FROM sites
 WHERE is_active = true
   AND regexp_replace(lower(btrim(domain)), '^www\.', '') = sqlc.arg('domain')::text
 LIMIT 1;
+
+-- ---------------------------------------------------------------------------
+-- PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
+--
+-- This file is not a queries file of its own -- it exists only because
+-- queries/applications.sql was not part of the phase upload. Delete it once the
+-- query has been moved across.
+--
+-- If applications.sql keeps updated_at current with a trigger rather than in
+-- each statement, drop the `updated_at = now()` line to match the other writes
+-- in that file.
+-- ---------------------------------------------------------------------------
+
+-- name: SetApplicationAIScore :one
+-- Writes the GPT-4o-mini job-match score. Called inside the same transaction as
+-- CreateApplication (Flow 1 step 23), and available on its own as the retry path
+-- for an application saved while scoring was unavailable.
+UPDATE applications
+SET ai_score             = sqlc.narg(ai_score),
+    ai_score_explanation = sqlc.narg(ai_score_explanation),
+    updated_at           = now()
+WHERE id = sqlc.arg(id)
+RETURNING *;

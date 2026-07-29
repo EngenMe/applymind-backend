@@ -374,6 +374,57 @@ func (q *Queries) ResolveSiteByDomain(ctx context.Context, domain string) (Site,
 	return i, err
 }
 
+const setApplicationAIScore = `-- name: SetApplicationAIScore :one
+
+UPDATE applications
+SET ai_score             = $1,
+    ai_score_explanation = $2,
+    updated_at           = now()
+WHERE id = $3
+RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at
+`
+
+type SetApplicationAIScoreParams struct {
+	AiScore            *float64  `json:"ai_score"`
+	AiScoreExplanation *string   `json:"ai_score_explanation"`
+	ID                 uuid.UUID `json:"id"`
+}
+
+// ---------------------------------------------------------------------------
+// PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
+//
+// This file is not a queries file of its own -- it exists only because
+// queries/applications.sql was not part of the phase upload. Delete it once the
+// query has been moved across.
+//
+// If applications.sql keeps updated_at current with a trigger rather than in
+// each statement, drop the `updated_at = now()` line to match the other writes
+// in that file.
+// ---------------------------------------------------------------------------
+// Writes the GPT-4o-mini job-match score. Called inside the same transaction as
+// CreateApplication (Flow 1 step 23), and available on its own as the retry path
+// for an application saved while scoring was unavailable.
+func (q *Queries) SetApplicationAIScore(ctx context.Context, arg SetApplicationAIScoreParams) (Application, error) {
+	row := q.db.QueryRow(ctx, setApplicationAIScore, arg.AiScore, arg.AiScoreExplanation, arg.ID)
+	var i Application
+	err := row.Scan(
+		&i.ID,
+		&i.CompanyName,
+		&i.JobTitle,
+		&i.JobDescription,
+		&i.JobUrl,
+		&i.SiteID,
+		&i.CvVersionID,
+		&i.Status,
+		&i.AiScore,
+		&i.AiScoreExplanation,
+		&i.AppliedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateApplication = `-- name: UpdateApplication :one
 UPDATE applications
 SET company_name    = $2,

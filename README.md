@@ -140,3 +140,7 @@ directly.
 | `follow_up_reminders.application_id` | `UNIQUE` | partial unique index where not sent/dismissed | Plain UNIQUE allows only one reminder per application for all time. |
 | `applications` duplicate guard | not specified | `UNIQUE (site_id, job_url)` | Service-layer checks alone race under concurrent inserts. |
 | Auth | API key (MVP) | API key | Phase 2 replaces this with JWT per the diagram's annotation. |
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

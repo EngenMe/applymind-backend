@@ -3,3 +3,6 @@ bootstrap
 /bin/
 *.zip
 .DS_Store
+# Phase 8 — CDK infra
+infra/cdk.out/
+infra/lambda/*/bootstrap

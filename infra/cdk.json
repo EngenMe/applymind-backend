@@ -1,0 +1,12 @@
+{
+  "app": "go run .",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk*.json", "**/*.d.ts", "**/*.js", "lambda/**"]
+  },
+  "context": {
+    "@aws-cdk/core:newStyleStackSynthesis": true,
+    "@aws-cdk/aws-apigateway:disableCloudWatchRole": false,
+    "@aws-cdk/core:enablePartitionLiterals": true
+  }
+}

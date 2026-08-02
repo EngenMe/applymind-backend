@@ -133,10 +133,10 @@ func NewApplymindStack(scope constructs.Construct, id string, props *awscdk.Stac
 			MemorySize:   jsii.Number(256),
 			// API Gateway's own integration timeout is a hard 29s, so anything
 			// higher here can never actually be reached on this path.
-			Timeout:   awscdk.Duration_Seconds(jsii.Number(29)),
-			Tracing:   awslambda.Tracing_ACTIVE,
-			Role:      apiRole,
-			LogGroup:  apiLogGroup,
+			Timeout:     awscdk.Duration_Seconds(jsii.Number(29)),
+			Tracing:     awslambda.Tracing_ACTIVE,
+			Role:        apiRole,
+			LogGroup:    apiLogGroup,
 			Environment: &apiEnv,
 		},
 	)
@@ -157,8 +157,8 @@ func NewApplymindStack(scope constructs.Construct, id string, props *awscdk.Stac
 
 	cert := awscertificatemanager.NewCertificate(
 		stack, jsii.String("ApiCertificate"), &awscertificatemanager.CertificateProps{
-			DomainName:  jsii.String(apiDomainName),
-			Validation:  awscertificatemanager.CertificateValidation_FromDns(zone),
+			DomainName: jsii.String(apiDomainName),
+			Validation: awscertificatemanager.CertificateValidation_FromDns(zone),
 		},
 	)
 

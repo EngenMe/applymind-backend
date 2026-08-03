@@ -6,6 +6,34 @@ functions behind API Gateway, backed by Neon PostgreSQL and S3.
 **Status: Phase 1 — foundation only.** Schema, configuration and entry points
 are in place; no business logic is implemented yet.
 
+## Architecture
+
+```
+extension ─┐
+           ├─► API Gateway ──► Lambda 1 (applymind-api) ──► Neon PostgreSQL
+dashboard ─┘                          │
+                                       └──────────────────► S3
+
+EventBridge (daily cron) ──► Lambda 2 (applymind-scheduler) ──► Neon PostgreSQL
+                                       │
+                                       └──► Resend (follow-up reminder emails)
+```
+
+![AWS architecture — MVP](docs/diagrams/applymind-aws-architecture-mvp.drawio.png)
+
+Both Lambdas share one Go codebase and detect at startup whether they're
+running under the Lambda runtime or locally, so the same binary serves both
+environments. See [Layout](#layout) below for how the code itself is split.
+
+## Database schema
+
+The full schema below, including every constraint and `ON DELETE` behaviour
+between tables, is generated straight from the migrations in `migrations/` via
+`sqlc` — nothing here should ever drift from what's actually applied, since
+`sqlc` would fail to compile against a schema this diagram doesn't match.
+
+![ApplyMind ERD](docs/diagrams/ERD-ApplyMind.drawio.png)
+
 ## Requirements
 
 - Go 1.25+
@@ -130,6 +158,43 @@ Each feature module follows the same four-file split: `handler.go` (HTTP only),
 `service.go` (business rules), `repository.go` (persistence), `model.go`
 (types). Dependencies point inward — handlers never touch the database
 directly.
+
+## Key flows
+
+Four sequences worth seeing rather than just reading about.
+
+### CV upload and version detection
+
+Every uploaded CV is hashed with SHA-256 before it's stored. If the hash
+already exists under that CV, nothing new is written — the existing version is
+returned instead, which is what lets the dashboard say "already stored" rather
+than silently duplicating identical bytes.
+
+![CV upload and version detection decision tree](docs/diagrams/applymind-flow3-cv-upload-and-version-detection-decision-tree.drawio.png)
+
+### Follow-up reminder — scheduled flow
+
+`cmd/scheduler`'s entire job, end to end: EventBridge's daily cron invocation,
+the query for reminders due, the per-reminder email dispatch through Resend,
+and the failure handling that leaves a reminder unsent (and therefore retried
+tomorrow) rather than losing it.
+
+![Follow-up reminder scheduled flow](docs/diagrams/applymind-flow4-follow-up-reminder-scheduled-flow.drawio.png)
+
+### LinkedIn apply — happy path
+
+Client-side capture, not backend logic — this happens in the browser
+extension, before `POST /applications` is ever called. Included here for
+context on what that endpoint actually receives and why.
+
+![LinkedIn apply happy path](docs/diagrams/applymind-flow1-linkedIn-apply-happy-path.drawio.png)
+
+### LinkedIn redirect to an external company site
+
+The other capture path: LinkedIn hands off to a company's own careers page
+mid-application. Same reasoning as above — extension-side, shown for context.
+
+![LinkedIn redirect to external company site](docs/diagrams/applymind-flow2-linkedIn-redirect-to-external-company-site.drawio.png)
 
 ## Known deviations from the design documents
 

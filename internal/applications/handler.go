@@ -37,6 +37,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/applications/{id}", h.Get)
 	r.Put("/applications/{id}", h.Update)
 	r.Patch("/applications/{id}/status", h.UpdateStatus)
+	r.Patch("/applications/{id}/complete", h.Complete)
 	r.Delete("/applications/{id}", h.Delete)
 }
 
@@ -77,6 +78,16 @@ type statusRequest struct {
 	ChangedBy string  `json:"changed_by"`
 }
 
+// completeRequest is what the extension sends from the external site. Every
+// field is optional: pressing "Mark as Complete" with nothing attached still
+// means the application was sent.
+type completeRequest struct {
+	CVVersionID     *uuid.UUID `json:"cv_version_id"`
+	CoverLetterText *string    `json:"cover_letter_text"`
+	Note            *string    `json:"note"`
+	CompletedAt     *time.Time `json:"completed_at"`
+}
+
 type applicationResponse struct {
 	ID                 uuid.UUID         `json:"id"`
 	CompanyName        string            `json:"company_name"`
@@ -112,9 +123,24 @@ type createResponse struct {
 	FollowUpDueAt *time.Time          `json:"follow_up_due_at,omitempty"`
 }
 
+// completeResponse mirrors createResponse. No duplicate warning: the duplicate
+// question was answered when the application was first saved, before the browser
+// ever left LinkedIn.
+type completeResponse struct {
+	Application   applicationResponse `json:"application"`
+	FollowUpDueAt *time.Time          `json:"follow_up_due_at,omitempty"`
+}
+
+// duplicatePayload sorts the matches so the client can phrase the warning
+// honestly: LikelySame is "you may have already applied to this job",
+// CrossSite is the same job found under a different site, and Matches is
+// everything on record for this company.
 type duplicatePayload struct {
 	CompanyName string                `json:"company_name"`
+	JobTitle    string                `json:"job_title,omitempty"`
 	Matches     []applicationResponse `json:"matches"`
+	LikelySame  []applicationResponse `json:"likely_same_job,omitempty"`
+	CrossSite   []applicationResponse `json:"cross_site,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -157,10 +183,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		FollowUpDueAt: result.FollowUpDueAt,
 	}
 	if result.Duplicate != nil {
-		resp.Duplicate = &duplicatePayload{
-			CompanyName: result.Duplicate.CompanyName,
-			Matches:     toResponses(result.Duplicate.Matches),
-		}
+		resp.Duplicate = toDuplicatePayload(result.Duplicate)
 	}
 	h.writeJSON(w, http.StatusCreated, resp)
 }
@@ -277,6 +300,49 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, toResponse(*app))
 }
 
+// Complete — PATCH /applications/{id}/complete
+//
+// Flow 2, step 29. Finishes an application submitted on a company's own site:
+// attaches the CV version and cover letter that went with it, moves the
+// application to Applied and schedules the follow-up, in one call.
+//
+// Body, all fields optional:
+//
+//	{"cv_version_id": "...", "cover_letter_text": "...", "note": "...",
+//	 "completed_at": "2026-08-05T09:12:00Z"}
+//
+// An application that is already Applied comes back 409 — it has been sent.
+func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	var req completeRequest
+	if !h.decode(w, r, &req) {
+		return
+	}
+
+	result, err := h.svc.Complete(
+		r.Context(), id, CompleteInput{
+			CVVersionID:     req.CVVersionID,
+			CoverLetterText: req.CoverLetterText,
+			Note:            req.Note,
+			CompletedAt:     req.CompletedAt,
+		},
+	)
+	if err != nil {
+		h.writeServiceError(w, r, err)
+		return
+	}
+
+	h.writeJSON(
+		w, http.StatusOK, completeResponse{
+			Application:   toResponse(*result.Application),
+			FollowUpDueAt: result.FollowUpDueAt,
+		},
+	)
+}
+
 // Delete — DELETE /applications/{id}
 // Cover letter, status history, reminders and recruiter contact go with it.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -292,11 +358,29 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// CheckDuplicate — GET /applications/check-duplicate?company=X
-// A pre-flight check for the sidebar. It never blocks anything; POST
-// /applications reports the same warning if the user saves anyway.
+// CheckDuplicate — GET /applications/check-duplicate?company=X&title=Y&job_url=Z
+//
+// A pre-flight check for the sidebar and the dashboard's create form. company is
+// required; title turns "applied here before" into "may have applied to this
+// job"; job_url (or site_id) is what lets a match be reported as cross-site.
+//
+// It never blocks anything, and neither does POST /applications, which reports
+// the same warning if the user saves anyway.
 func (h *Handler) CheckDuplicate(w http.ResponseWriter, r *http.Request) {
-	warning, err := h.svc.CheckDuplicate(r.Context(), r.URL.Query().Get("company"))
+	q := r.URL.Query()
+	siteID, ok := h.optionalUUID(w, q.Get("site_id"), "invalid_site_id")
+	if !ok {
+		return
+	}
+
+	warning, err := h.svc.CheckDuplicate(
+		r.Context(), DuplicateQuery{
+			Company:  q.Get("company"),
+			JobTitle: q.Get("title"),
+			SiteID:   siteID,
+			JobURL:   q.Get("job_url"),
+		},
+	)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -306,11 +390,16 @@ func (h *Handler) CheckDuplicate(w http.ResponseWriter, r *http.Request) {
 		h.writeJSON(w, http.StatusOK, map[string]any{"duplicate": false, "matches": []applicationResponse{}})
 		return
 	}
+
+	payload := toDuplicatePayload(warning)
 	h.writeJSON(
 		w, http.StatusOK, map[string]any{
-			"duplicate":    true,
-			"company_name": warning.CompanyName,
-			"matches":      toResponses(warning.Matches),
+			"duplicate":       true,
+			"company_name":    payload.CompanyName,
+			"job_title":       payload.JobTitle,
+			"matches":         payload.Matches,
+			"likely_same_job": payload.LikelySame,
+			"cross_site":      payload.CrossSite,
 		},
 	)
 }
@@ -426,6 +515,16 @@ func toResponses(apps []Application) []applicationResponse {
 		out = append(out, toResponse(app))
 	}
 	return out
+}
+
+func toDuplicatePayload(warning *DuplicateWarning) *duplicatePayload {
+	return &duplicatePayload{
+		CompanyName: warning.CompanyName,
+		JobTitle:    warning.JobTitle,
+		Matches:     toResponses(warning.Matches),
+		LikelySame:  toResponses(warning.LikelySame),
+		CrossSite:   toResponses(warning.CrossSite),
+	}
 }
 
 // errorBody mirrors the envelope used by the cvs and coverletters modules.

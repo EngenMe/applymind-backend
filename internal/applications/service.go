@@ -50,10 +50,15 @@ type Service interface {
 	// UpdateStatus transitions the application and writes the audit row in the
 	// same transaction, so a status can never change without a history entry.
 	UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdateInput) (*Application, error)
+	// Complete finishes an In Progress application — Flow 2's "Mark as
+	// Complete". It attaches the CV version and cover letter the external site
+	// received, moves the application to Applied and starts the follow-up clock,
+	// all in one call.
+	Complete(ctx context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 	// CheckDuplicate backs GET /applications/check-duplicate, letting the sidebar
 	// warn before the user commits to saving.
-	CheckDuplicate(ctx context.Context, company string) (*DuplicateWarning, error)
+	CheckDuplicate(ctx context.Context, q DuplicateQuery) (*DuplicateWarning, error)
 	StatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHistory, error)
 }
 
@@ -172,7 +177,8 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 	}
 
 	// The sidebar's Save button means Applied; the dashboard can pass Saved for
-	// a job the user is only tracking.
+	// a job the user is only tracking, and Flow 2's partial save passes
+	// In Progress.
 	status := in.Status
 	if status == "" {
 		status = StatusApplied
@@ -193,7 +199,7 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 
 	// Flow 1, steps 19–20. A match is a warning the caller may act on; it never
 	// stops the save. Embedding-based similarity is a later phase.
-	warning, err := s.CheckDuplicate(ctx, company)
+	warning, err := s.CheckDuplicate(ctx, DuplicateQuery{Company: company, JobTitle: title, SiteID: &siteID})
 	if err != nil {
 		return nil, err
 	}
@@ -437,24 +443,180 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 	return updated, nil
 }
 
+// Complete implements Flow 2, steps 28–34: the user has submitted the form on
+// the company's own site and pressed "Mark as Complete" in the extension.
+//
+// It is one call rather than the three the extension would otherwise have to
+// make (attach CV, save cover letter, move status) because the three belong
+// together: an application that ends up Applied with the CV missing is a worse
+// record than no record at all, and the offline queue would have to replay all
+// three in order to avoid exactly that.
+//
+// The cover letter is saved first, before anything moves. It is the one write
+// that cannot join the transaction — it belongs to the coverletters module — and
+// unlike Create there is no compensating delete available here, because the
+// application predates this call and must survive a failure. Doing it first
+// means a failure leaves the application exactly as it was, still In Progress
+// and still completable.
+//
+// Scoring deliberately does not run here. The job description was captured on
+// LinkedIn and scored when the partial application was created; re-scoring the
+// same description would spend a model call to arrive at the same answer.
+func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Already sent. Completing twice is the double-submit case — the tab left
+	// open in the background, the button pressed again — and the honest answer
+	// is that there is nothing left to do.
+	if current.Status == StatusApplied {
+		return nil, ErrSameStatus
+	}
+
+	coverLetter := strings.TrimSpace(deref(in.CoverLetterText))
+	if coverLetter != "" && s.coverLetters == nil {
+		return nil, ErrCoverLettersUnavailable
+	}
+
+	// applied_at records when the application was actually sent. Write-once, so
+	// an application that somehow already carries one keeps it.
+	appliedAt := current.AppliedAt
+	if appliedAt == nil {
+		at := s.now().UTC()
+		if in.CompletedAt != nil {
+			at = in.CompletedAt.UTC()
+		}
+		appliedAt = &at
+	}
+	dueAt := FollowUpDueAt(*appliedAt, s.followUpDelay)
+
+	if coverLetter != "" {
+		if _, err := s.coverLetters.SaveText(
+			ctx, coverletters.SaveTextInput{
+				ApplicationID: id,
+				BodyText:      coverLetter,
+			},
+		); err != nil {
+			return nil, fmt.Errorf("applications: save cover letter: %w", err)
+		}
+	}
+
+	var completed *Application
+	err = s.repo.Tx(
+		ctx, func(tx Repository) error {
+			// Attaching the CV version reuses the captured-data update with every
+			// other field left as it was: the external site never changes what
+			// the job is, only what was sent to it.
+			if in.CVVersionID != nil {
+				if _, err := tx.Update(
+					ctx, id, UpdateFields{
+						CompanyName:    current.CompanyName,
+						JobTitle:       current.JobTitle,
+						JobDescription: current.JobDescription,
+						JobURL:         current.JobURL,
+						SiteID:         current.SiteID,
+						CVVersionID:    in.CVVersionID,
+					},
+				); err != nil {
+					return err
+				}
+			}
+
+			app, err := tx.UpdateStatus(ctx, id, StatusApplied, appliedAt)
+			if err != nil {
+				return err
+			}
+
+			from := current.Status
+			if _, err := tx.CreateStatusHistory(
+				ctx, NewStatusHistory{
+					ApplicationID: id,
+					FromStatus:    &from,
+					ToStatus:      StatusApplied,
+					ChangedBy:     ChangeSourceUser,
+					Note:          in.Note,
+				},
+			); err != nil {
+				return err
+			}
+
+			if err := tx.EnsurePendingReminder(ctx, id, dueAt); err != nil {
+				return err
+			}
+
+			completed = app
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CompleteResult{Application: completed, FollowUpDueAt: &dueAt}, nil
+}
+
 func (s *service) Delete(ctx context.Context, id uuid.UUID) error {
 	return s.repo.Delete(ctx, id)
 }
 
-func (s *service) CheckDuplicate(ctx context.Context, company string) (*DuplicateWarning, error) {
-	name := strings.TrimSpace(company)
-	if name == "" {
+// CheckDuplicate answers "have I been here before?" in three widening circles.
+//
+// The company match is exact and done in SQL. Everything after it is sorting:
+// which of those existing applications look like this same job, and which of
+// those were saved from a different site — the LinkedIn posting the user already
+// applied to, now in front of them again on the company's own board.
+//
+// A company with no previous application returns (nil, nil), which every caller
+// reads as "nothing to say".
+func (s *service) CheckDuplicate(ctx context.Context, q DuplicateQuery) (*DuplicateWarning, error) {
+	company := strings.TrimSpace(q.Company)
+	if company == "" {
 		return nil, ErrCompanyRequired
 	}
 
-	matches, err := s.repo.FindByCompanyName(ctx, name)
+	found, err := s.repo.FindByCompanyName(ctx, company)
 	if err != nil {
 		return nil, err
+	}
+
+	matches := make([]Application, 0, len(found))
+	for _, app := range found {
+		if q.ExcludeID != nil && app.ID == *q.ExcludeID {
+			continue
+		}
+		matches = append(matches, app)
 	}
 	if len(matches) == 0 {
 		return nil, nil
 	}
-	return &DuplicateWarning{CompanyName: name, Matches: matches}, nil
+
+	title := strings.TrimSpace(q.JobTitle)
+	warning := &DuplicateWarning{CompanyName: company, JobTitle: title, Matches: matches}
+	if title == "" {
+		return warning, nil
+	}
+
+	// Knowing which site this save is for is what makes a match cross-site. It
+	// is a nicety, not a requirement: an unresolvable site leaves CrossSite
+	// empty rather than failing a check that exists to be informative.
+	siteID := q.SiteID
+	if siteID == nil && strings.TrimSpace(q.JobURL) != "" {
+		if resolved, err := s.resolveSiteID(ctx, nil, strings.TrimSpace(q.JobURL)); err == nil {
+			siteID = &resolved
+		}
+	}
+
+	for _, match := range matches {
+		if !TitlesLikelySame(title, match.JobTitle) {
+			continue
+		}
+		warning.LikelySame = append(warning.LikelySame, match)
+		if siteID != nil && match.SiteID != *siteID {
+			warning.CrossSite = append(warning.CrossSite, match)
+		}
+	}
+	return warning, nil
 }
 
 func (s *service) StatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHistory, error) {
@@ -486,7 +648,11 @@ func (s *service) scoreJob(ctx context.Context, company, title, jobDescription s
 		return nil
 	}
 	if strings.TrimSpace(jobDescription) == "" {
-		s.logger.DebugContext(ctx, "applications: skipping ai score, no job description", slog.String("company", company))
+		s.logger.DebugContext(
+			ctx,
+			"applications: skipping ai score, no job description",
+			slog.String("company", company),
+		)
 		return nil
 	}
 

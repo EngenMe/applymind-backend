@@ -1,0 +1,12 @@
+-- Flow 2 (steps 5-7) saves a partial application before the browser leaves
+-- LinkedIn for the company's own site. That row is neither "Saved" (the user is
+-- not merely bookmarking it) nor "Applied" (nothing has been submitted yet), so
+-- the lifecycle gains one value.
+--
+-- BEFORE 'Applied' keeps the enum's sort order reading as the real lifecycle,
+-- which is what the dashboard groups and orders its columns by.
+--
+-- PostgreSQL 12+ allows ADD VALUE inside a transaction block, which is how
+-- golang-migrate runs each file; the new value simply cannot be *used* until
+-- that transaction commits. Nothing else in this migration uses it.
+ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'In Progress' BEFORE 'Applied';

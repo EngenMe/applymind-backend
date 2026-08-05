@@ -17,18 +17,21 @@ import (
 // fakeService records what the handler passed down and returns canned answers,
 // so these tests cover routing, decoding, query parsing and status codes only.
 type fakeService struct {
-	createIn  CreateInput
-	updateIn  UpdateInput
-	statusIn  StatusUpdateInput
-	listIn    ListFilter
-	dupIn     string
-	deletedID uuid.UUID
+	createIn   CreateInput
+	updateIn   UpdateInput
+	statusIn   StatusUpdateInput
+	listIn     ListFilter
+	dupIn      DuplicateQuery
+	deletedID  uuid.UUID
+	completeID uuid.UUID
+	completeIn CompleteInput
 
-	createResult *CreateResult
-	application  *Application
-	list         []Application
-	duplicate    *DuplicateWarning
-	err          error
+	createResult   *CreateResult
+	application    *Application
+	list           []Application
+	duplicate      *DuplicateWarning
+	completeResult *CompleteResult
+	err            error
 }
 
 func (f *fakeService) Create(_ context.Context, in CreateInput) (*CreateResult, error) {
@@ -70,13 +73,26 @@ func (f *fakeService) UpdateStatus(_ context.Context, _ uuid.UUID, in StatusUpda
 	return f.application, nil
 }
 
+// Complete backs PATCH /applications/{id}/complete — Phase 13, Flow 2.
+func (f *fakeService) Complete(_ context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
+	f.completeID = id
+	f.completeIn = in
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.completeResult, nil
+}
+
 func (f *fakeService) Delete(_ context.Context, id uuid.UUID) error {
 	f.deletedID = id
 	return f.err
 }
 
-func (f *fakeService) CheckDuplicate(_ context.Context, company string) (*DuplicateWarning, error) {
-	f.dupIn = company
+// CheckDuplicate takes a DuplicateQuery as of Phase 13, rather than a bare
+// company string, so a title (and site) can sharpen the match into
+// LikelySame/CrossSite rather than only Matches.
+func (f *fakeService) CheckDuplicate(_ context.Context, q DuplicateQuery) (*DuplicateWarning, error) {
+	f.dupIn = q
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -228,19 +244,21 @@ func TestErrorMapping(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			svc := &fakeService{err: tc.err}
-			rec := do(
-				t, newTestRouter(svc), http.MethodPost, "/applications",
-				`{"company_name":"Stripe","job_title":"Engineer","job_url":"https://linkedin.com/jobs/1"}`,
-			)
-			if rec.Code != tc.want {
-				t.Errorf("status = %d, want %d", rec.Code, tc.want)
-			}
-			if body := decodeBody(t, rec); body["error"] == nil {
-				t.Error("error envelope missing from the response")
-			}
-		})
+		t.Run(
+			tc.name, func(t *testing.T) {
+				svc := &fakeService{err: tc.err}
+				rec := do(
+					t, newTestRouter(svc), http.MethodPost, "/applications",
+					`{"company_name":"Stripe","job_title":"Engineer","job_url":"https://linkedin.com/jobs/1"}`,
+				)
+				if rec.Code != tc.want {
+					t.Errorf("status = %d, want %d", rec.Code, tc.want)
+				}
+				if body := decodeBody(t, rec); body["error"] == nil {
+					t.Error("error envelope missing from the response")
+				}
+			},
+		)
 	}
 }
 
@@ -414,8 +432,8 @@ func TestCheckDuplicateEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if svc.dupIn != "Stripe" {
-		t.Errorf("company reached the service as %q", svc.dupIn)
+	if svc.dupIn.Company != "Stripe" {
+		t.Errorf("company reached the service as %q", svc.dupIn.Company)
 	}
 	if body := decodeBody(t, rec); body["duplicate"] != true {
 		t.Errorf("duplicate = %v, want true", body["duplicate"])
@@ -443,7 +461,117 @@ func TestCheckDuplicateRouteBeatsIDRoute(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d — the id route captured check-duplicate", rec.Code, http.StatusOK)
 	}
-	if svc.dupIn == "" {
+	if svc.dupIn.Company == "" {
 		t.Error("the request did not reach CheckDuplicate")
+	}
+}
+
+// TestCheckDuplicateEndpointPassesTitleAndSite — Phase 13. Both title and
+// site_id turn "applied to this company" into "applied to this exact job",
+// and site_id is what makes a match cross-site; the endpoint has to forward
+// both rather than only company.
+func TestCheckDuplicateEndpointPassesTitleAndSite(t *testing.T) {
+	svc := &fakeService{}
+
+	rec := do(
+		t, newTestRouter(svc), http.MethodGet,
+		"/applications/check-duplicate?company=Stripe&title=Backend+Engineer&site_id="+linkedIn.ID.String(), "",
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if svc.dupIn.JobTitle != "Backend Engineer" {
+		t.Errorf("title reached the service as %q", svc.dupIn.JobTitle)
+	}
+	if svc.dupIn.SiteID == nil || *svc.dupIn.SiteID != linkedIn.ID {
+		t.Errorf("site_id reached the service as %v", svc.dupIn.SiteID)
+	}
+}
+
+func TestCheckDuplicateEndpointRejectsBadSiteID(t *testing.T) {
+	rec := do(
+		t, newTestRouter(&fakeService{}), http.MethodGet,
+		"/applications/check-duplicate?company=Stripe&site_id=not-a-uuid", "",
+	)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /applications/{id}/complete — Phase 13, Flow 2
+// ---------------------------------------------------------------------------
+
+func TestPatchCompleteAppliesTheCompletion(t *testing.T) {
+	app := sampleApplication()
+	due := fixedNow.Add(DefaultFollowUpDelay)
+	cvVersionID := uuid.New()
+	svc := &fakeService{completeResult: &CompleteResult{Application: app, FollowUpDueAt: &due}}
+
+	rec := do(
+		t, newTestRouter(svc), http.MethodPatch, "/applications/"+app.ID.String()+"/complete",
+		`{"cv_version_id":"`+cvVersionID.String()+`","cover_letter_text":"Dear Acme, ...","note":"submitted via Greenhouse"}`,
+	)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if svc.completeID != app.ID {
+		t.Errorf("completed id = %v, want %v", svc.completeID, app.ID)
+	}
+	if svc.completeIn.CVVersionID == nil || *svc.completeIn.CVVersionID != cvVersionID {
+		t.Errorf("cv_version_id reached the service as %v", svc.completeIn.CVVersionID)
+	}
+	if svc.completeIn.CoverLetterText == nil || *svc.completeIn.CoverLetterText != "Dear Acme, ..." {
+		t.Errorf("cover_letter_text reached the service as %v", svc.completeIn.CoverLetterText)
+	}
+	if svc.completeIn.Note == nil || *svc.completeIn.Note != "submitted via Greenhouse" {
+		t.Errorf("note reached the service as %v", svc.completeIn.Note)
+	}
+
+	body := decodeBody(t, rec)
+	if _, ok := body["application"]; !ok {
+		t.Error("response has no application object")
+	}
+	if body["follow_up_due_at"] == nil {
+		t.Error("follow_up_due_at missing from the response")
+	}
+}
+
+// An empty body still means something: "Mark as Complete" pressed with
+// nothing attached is still a completion.
+func TestPatchCompleteWithNoBodyIsStillValid(t *testing.T) {
+	app := sampleApplication()
+	svc := &fakeService{completeResult: &CompleteResult{Application: app}}
+
+	rec := do(t, newTestRouter(svc), http.MethodPatch, "/applications/"+app.ID.String()+"/complete", `{}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if svc.completeIn.CVVersionID != nil || svc.completeIn.CoverLetterText != nil {
+		t.Errorf("completeIn = %+v, want every field nil", svc.completeIn)
+	}
+}
+
+// Completing an application already Applied is the double-submit case and
+// comes back as a conflict, the same as re-applying the same status twice.
+func TestPatchCompleteConflictWhenAlreadyApplied(t *testing.T) {
+	svc := &fakeService{err: ErrSameStatus}
+
+	rec := do(
+		t, newTestRouter(svc), http.MethodPatch,
+		"/applications/"+uuid.New().String()+"/complete", `{}`,
+	)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+}
+
+func TestPatchCompleteBadID(t *testing.T) {
+	rec := do(t, newTestRouter(&fakeService{}), http.MethodPatch, "/applications/not-a-uuid/complete", `{}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
 }

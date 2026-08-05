@@ -14,7 +14,11 @@ import (
 type Status string
 
 const (
-	StatusSaved              Status = "Saved"
+	StatusSaved Status = "Saved"
+	// StatusInProgress is an application that has been started but not sent:
+	// Flow 2 writes it before the browser leaves LinkedIn for the company's own
+	// site, and "Mark as Complete" moves it on to Applied.
+	StatusInProgress         Status = "In Progress"
 	StatusApplied            Status = "Applied"
 	StatusAcknowledged       Status = "Acknowledged"
 	StatusInReview           Status = "In Review"
@@ -32,6 +36,7 @@ const (
 // a bad value becomes a 400 rather than a 500 from PostgreSQL.
 var statusOrder = []Status{
 	StatusSaved,
+	StatusInProgress,
 	StatusApplied,
 	StatusAcknowledged,
 	StatusInReview,
@@ -162,6 +167,22 @@ type StatusUpdateInput struct {
 	ChangedBy ChangeSource
 }
 
+// CompleteInput finishes an application started on one site and submitted on
+// another — Flow 2, steps 28–33. It is the one call that carries everything the
+// external site produced: which CV version went with it, the cover letter that
+// was typed into the company's own form, and the moment it was sent.
+//
+// Every field is optional. A completion with nothing attached is still a
+// completion: it means the user pressed the button and the application is out.
+// CompletedAt is honoured only when the application has no applied_at yet —
+// applied_at is write-once, as UpdateApplicationStatus's COALESCE enforces.
+type CompleteInput struct {
+	CVVersionID     *uuid.UUID
+	CoverLetterText *string
+	Note            *string
+	CompletedAt     *time.Time
+}
+
 // CreateResult is what a save produced.
 //
 // Duplicate is non-nil when another application already exists for this company.
@@ -174,12 +195,47 @@ type CreateResult struct {
 	FollowUpDueAt *time.Time
 }
 
-// DuplicateWarning lists the existing applications that matched. MVP scope is an
-// exact (trimmed, case-insensitive) company name match — embedding similarity is
-// a later phase.
+// CompleteResult is what "Mark as Complete" produced. FollowUpDueAt is always
+// set: completing means the application is now Applied, which is exactly when
+// the follow-up clock starts.
+type CompleteResult struct {
+	Application   *Application
+	FollowUpDueAt *time.Time
+}
+
+// DuplicateQuery is one duplicate check. Company is required; everything else
+// sharpens the answer rather than filtering it.
+//
+// JobTitle turns "you have applied here before" into "you may have already
+// applied to this exact job", which is the difference between a note and a
+// warning worth stopping for. SiteID (or JobURL, from which the site is derived)
+// is what makes a match cross-site: the same posting on LinkedIn and on the
+// company's own board is the case the user most wants catching.
+type DuplicateQuery struct {
+	Company  string
+	JobTitle string
+	SiteID   *uuid.UUID
+	JobURL   string
+	// ExcludeID keeps an application from matching itself when the check runs
+	// on behalf of an edit.
+	ExcludeID *uuid.UUID
+}
+
+// DuplicateWarning lists the existing applications that matched, in three
+// widening circles: LikelySame is the same job, CrossSite is the same job saved
+// under a different site, and Matches is every application for this company.
+//
+// MVP scope is an exact (trimmed, case-insensitive) company name plus the token
+// similarity in duplicates.go — embedding similarity is a later phase.
 type DuplicateWarning struct {
 	CompanyName string
-	Matches     []Application
+	// JobTitle is the title the matches were compared against. Empty when the
+	// caller did not supply one, in which case LikelySame and CrossSite are
+	// empty too: with nothing to compare, every match is only a company match.
+	JobTitle   string
+	Matches    []Application
+	LikelySame []Application
+	CrossSite  []Application
 }
 
 // ListFilter is the combined filter/search query behind GET /applications.
@@ -243,7 +299,8 @@ var (
 	ErrInvalidChangeSource = errors.New("applications: unknown status change source")
 	// ErrSameStatus is returned when a transition would not change anything. The
 	// ck_status_history_actual_transition constraint would reject the audit row
-	// anyway; this catches it before the write.
+	// anyway; this catches it before the write. Completing an application that
+	// is already Applied comes back as this too — it has already been sent.
 	ErrSameStatus = errors.New("applications: application is already in that status")
 	// ErrSiteUnresolvable means no site_id was supplied and the job url has no
 	// host to derive one from.

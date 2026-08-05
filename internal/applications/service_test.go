@@ -254,8 +254,12 @@ func containsFold(haystack, needle string) bool {
 // ---------------------------------------------------------------------------
 
 var (
-	fixedNow  = time.Date(2026, 5, 16, 9, 0, 0, 0, time.UTC)
-	linkedIn  = Site{ID: uuid.MustParse("11111111-1111-1111-1111-111111111111"), Name: "LinkedIn", Domain: "linkedin.com"}
+	fixedNow = time.Date(2026, 5, 16, 9, 0, 0, 0, time.UTC)
+	linkedIn = Site{
+		ID:     uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		Name:   "LinkedIn",
+		Domain: "linkedin.com",
+	}
 	newAppID  = uuid.MustParse("22222222-2222-2222-2222-222222222222")
 	cvVersion = uuid.MustParse("33333333-3333-3333-3333-333333333333")
 )
@@ -434,15 +438,17 @@ func TestCreateValidation(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, _, svc := newTestService(t)
-			in := validInput()
-			tc.mutate(&in)
+		t.Run(
+			tc.name, func(t *testing.T) {
+				_, _, svc := newTestService(t)
+				in := validInput()
+				tc.mutate(&in)
 
-			if _, err := svc.Create(context.Background(), in); !errors.Is(err, tc.want) {
-				t.Errorf("error = %v, want %v", err, tc.want)
-			}
-		})
+				if _, err := svc.Create(context.Background(), in); !errors.Is(err, tc.want) {
+					t.Errorf("error = %v, want %v", err, tc.want)
+				}
+			},
+		)
 	}
 }
 
@@ -665,12 +671,18 @@ func seedForListing(repo *fakeRepo) {
 		}
 	}
 
-	mk("aaaaaaaa-0000-0000-0000-000000000001", "Stripe", "Senior Backend Engineer",
-		StatusApplied, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), &cvVersion)
-	mk("aaaaaaaa-0000-0000-0000-000000000002", "Monzo", "Backend Engineer",
-		StatusInterviewing, time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC), nil)
-	mk("aaaaaaaa-0000-0000-0000-000000000003", "Stripe", "Platform Engineer",
-		StatusRejected, time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC), &cvVersion)
+	mk(
+		"aaaaaaaa-0000-0000-0000-000000000001", "Stripe", "Senior Backend Engineer",
+		StatusApplied, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC), &cvVersion,
+	)
+	mk(
+		"aaaaaaaa-0000-0000-0000-000000000002", "Monzo", "Backend Engineer",
+		StatusInterviewing, time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC), nil,
+	)
+	mk(
+		"aaaaaaaa-0000-0000-0000-000000000003", "Stripe", "Platform Engineer",
+		StatusRejected, time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC), &cvVersion,
+	)
 }
 
 func TestListFilterCombinations(t *testing.T) {
@@ -698,18 +710,20 @@ func TestListFilterCombinations(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			repo, _, svc := newTestService(t)
-			seedForListing(repo)
+		t.Run(
+			tc.name, func(t *testing.T) {
+				repo, _, svc := newTestService(t)
+				seedForListing(repo)
 
-			got, err := svc.List(context.Background(), tc.filter)
-			if err != nil {
-				t.Fatalf("List: unexpected error: %v", err)
-			}
-			if len(got) != tc.want {
-				t.Errorf("results = %d, want %d", len(got), tc.want)
-			}
-		})
+				got, err := svc.List(context.Background(), tc.filter)
+				if err != nil {
+					t.Fatalf("List: unexpected error: %v", err)
+				}
+				if len(got) != tc.want {
+					t.Errorf("results = %d, want %d", len(got), tc.want)
+				}
+			},
+		)
 	}
 }
 
@@ -759,11 +773,14 @@ func TestListDropsBlankFilters(t *testing.T) {
 // Duplicate check, get, update, delete
 // ---------------------------------------------------------------------------
 
+// CheckDuplicate takes a DuplicateQuery as of Phase 13 — Company is the only
+// field this test cares about, so JobTitle/SiteID are left zero, which is
+// exactly what "just tell me about this company" means.
 func TestCheckDuplicate(t *testing.T) {
 	repo, _, svc := newTestService(t)
 	seedForListing(repo)
 
-	warning, err := svc.CheckDuplicate(context.Background(), "  stripe  ")
+	warning, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: "  stripe  "})
 	if err != nil {
 		t.Fatalf("CheckDuplicate: unexpected error: %v", err)
 	}
@@ -771,7 +788,7 @@ func TestCheckDuplicate(t *testing.T) {
 		t.Fatalf("warning = %+v, want 2 matches ignoring case and whitespace", warning)
 	}
 
-	none, err := svc.CheckDuplicate(context.Background(), "Vercel")
+	none, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: "Vercel"})
 	if err != nil {
 		t.Fatalf("CheckDuplicate: unexpected error: %v", err)
 	}
@@ -779,7 +796,10 @@ func TestCheckDuplicate(t *testing.T) {
 		t.Errorf("warning = %+v, want nil for a company never applied to", none)
 	}
 
-	if _, err := svc.CheckDuplicate(context.Background(), " "); !errors.Is(err, ErrCompanyRequired) {
+	if _, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: " "}); !errors.Is(
+		err,
+		ErrCompanyRequired,
+	) {
 		t.Errorf("error = %v, want %v", err, ErrCompanyRequired)
 	}
 }

@@ -16,6 +16,7 @@ type ApplicationStatus string
 
 const (
 	ApplicationStatusSaved              ApplicationStatus = "Saved"
+	ApplicationStatusInProgress         ApplicationStatus = "In Progress"
 	ApplicationStatusApplied            ApplicationStatus = "Applied"
 	ApplicationStatusAcknowledged       ApplicationStatus = "Acknowledged"
 	ApplicationStatusInReview           ApplicationStatus = "In Review"

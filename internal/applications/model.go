@@ -299,9 +299,15 @@ var (
 	ErrInvalidChangeSource = errors.New("applications: unknown status change source")
 	// ErrSameStatus is returned when a transition would not change anything. The
 	// ck_status_history_actual_transition constraint would reject the audit row
-	// anyway; this catches it before the write. Completing an application that
-	// is already Applied comes back as this too — it has already been sent.
+	// anyway; this catches it before the write.
 	ErrSameStatus = errors.New("applications: application is already in that status")
+	// ErrAlreadyCompleted is Complete's own version of ErrSameStatus: the
+	// application has already been marked complete and sent. Distinct because
+	// the user reaching it is doing something reasonable — reopening a tab,
+	// pressing the button twice, finishing a job they finished last week — and
+	// "already in that status" reads as a fault where "already complete" reads
+	// as an answer.
+	ErrAlreadyCompleted = errors.New("applications: application has already been completed")
 	// ErrSiteUnresolvable means no site_id was supplied and the job url has no
 	// host to derive one from.
 	ErrSiteUnresolvable = errors.New("applications: could not determine the site from the job url")

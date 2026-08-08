@@ -554,10 +554,11 @@ func TestPatchCompleteWithNoBodyIsStillValid(t *testing.T) {
 	}
 }
 
-// Completing an application already Applied is the double-submit case and
-// comes back as a conflict, the same as re-applying the same status twice.
+// Completing an application already Applied is the double-submit case. It is
+// still a conflict, but with its own code so the extension can say "already
+// complete" rather than the generic "already in that status".
 func TestPatchCompleteConflictWhenAlreadyApplied(t *testing.T) {
-	svc := &fakeService{err: ErrSameStatus}
+	svc := &fakeService{err: ErrAlreadyCompleted}
 
 	rec := do(
 		t, newTestRouter(svc), http.MethodPatch,
@@ -565,6 +566,14 @@ func TestPatchCompleteConflictWhenAlreadyApplied(t *testing.T) {
 	)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	body := decodeBody(t, rec)
+	envelope, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error envelope missing: %s", rec.Body.String())
+	}
+	if envelope["code"] != "already_completed" {
+		t.Errorf("code = %v, want already_completed", envelope["code"])
 	}
 }
 

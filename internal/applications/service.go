@@ -468,10 +468,11 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 		return nil, err
 	}
 	// Already sent. Completing twice is the double-submit case — the tab left
-	// open in the background, the button pressed again — and the honest answer
-	// is that there is nothing left to do.
+	// open in the background, the button pressed again, the same job opened
+	// again next week — and the honest answer is that there is nothing left to
+	// do, not that something went wrong.
 	if current.Status == StatusApplied {
-		return nil, ErrSameStatus
+		return nil, ErrAlreadyCompleted
 	}
 
 	coverLetter := strings.TrimSpace(deref(in.CoverLetterText))

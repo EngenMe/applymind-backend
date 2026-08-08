@@ -549,6 +549,11 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		h.writeError(w, http.StatusBadRequest, "invalid_status", "status is not a known application status")
 	case errors.Is(err, ErrInvalidChangeSource):
 		h.writeError(w, http.StatusBadRequest, "invalid_changed_by", "changed_by must be 'user' or 'system'")
+	case errors.Is(err, ErrAlreadyCompleted):
+		h.writeError(
+			w, http.StatusConflict, "already_completed",
+			"this application has already been marked complete",
+		)
 	case errors.Is(err, ErrSameStatus):
 		h.writeError(w, http.StatusConflict, "status_unchanged", "the application is already in that status")
 	case errors.Is(err, ErrSiteUnresolvable):

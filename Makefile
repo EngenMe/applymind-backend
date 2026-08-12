@@ -10,16 +10,16 @@ export
 MIGRATIONS_DIR := migrations
 
 migrate-up:
-	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DIRECT_URL)" up
+	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DATABASE_URL)" up
 
 migrate-down:
-	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DIRECT_URL)" down 1
+	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DATABASE_URL)" down 1
 
 migrate-drop:
-	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DIRECT_URL)" drop -f
+	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DATABASE_URL)" drop -f
 
 migrate-version:
-	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DIRECT_URL)" version
+	migrate -path $(MIGRATIONS_DIR) -database "$(NEON_DATABASE_URL)" version
 
 # Usage: make migrate-create NAME=add_something
 migrate-create:

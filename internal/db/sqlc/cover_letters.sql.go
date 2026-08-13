@@ -22,7 +22,7 @@ INSERT INTO cover_letters (
     original_filename
 )
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at
+RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 `
 
 type CreateCoverLetterParams struct {
@@ -60,6 +60,7 @@ func (q *Queries) CreateCoverLetter(ctx context.Context, arg CreateCoverLetterPa
 		&i.OriginalFilename,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -78,7 +79,7 @@ func (q *Queries) DeleteCoverLetterByApplicationID(ctx context.Context, applicat
 }
 
 const getCoverLetterByApplicationID = `-- name: GetCoverLetterByApplicationID :one
-SELECT id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at
+SELECT id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 FROM cover_letters
 WHERE application_id = $1
 `
@@ -95,6 +96,7 @@ func (q *Queries) GetCoverLetterByApplicationID(ctx context.Context, application
 		&i.OriginalFilename,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -105,7 +107,7 @@ SET body_text  = $2,
     updated_at = now()
 WHERE application_id = $1
   AND kind = 'text'
-RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at
+RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 `
 
 type UpdateCoverLetterTextParams struct {
@@ -128,6 +130,7 @@ func (q *Queries) UpdateCoverLetterText(ctx context.Context, arg UpdateCoverLett
 		&i.OriginalFilename,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }

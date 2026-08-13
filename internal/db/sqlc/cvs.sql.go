@@ -16,7 +16,7 @@ const createCV = `-- name: CreateCV :one
 
 INSERT INTO cvs (name, tag)
 VALUES ($1, $2)
-RETURNING id, name, tag, created_at, updated_at
+RETURNING id, name, tag, created_at, updated_at, user_id
 `
 
 type CreateCVParams struct {
@@ -37,6 +37,7 @@ func (q *Queries) CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error) 
 		&i.Tag,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -44,7 +45,7 @@ func (q *Queries) CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error) 
 const createCVVersion = `-- name: CreateCVVersion :one
 INSERT INTO cv_versions (id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at
+RETURNING id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id
 `
 
 type CreateCVVersionParams struct {
@@ -74,6 +75,7 @@ func (q *Queries) CreateCVVersion(ctx context.Context, arg CreateCVVersionParams
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -88,7 +90,7 @@ func (q *Queries) DeleteCV(ctx context.Context, id uuid.UUID) error {
 }
 
 const findCVVersionByCVAndHash = `-- name: FindCVVersionByCVAndHash :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 WHERE cv_id = $1 AND sha256_hash = $2
 LIMIT 1
 `
@@ -109,12 +111,13 @@ func (q *Queries) FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersio
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const findCVVersionByCVAndSize = `-- name: FindCVVersionByCVAndSize :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 WHERE cv_id = $1 AND file_size_bytes = $2
 ORDER BY uploaded_at DESC
 LIMIT 1
@@ -136,12 +139,13 @@ func (q *Queries) FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersio
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const findCVVersionByHash = `-- name: FindCVVersionByHash :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 WHERE sha256_hash = $1
 ORDER BY uploaded_at DESC
 LIMIT 1
@@ -158,12 +162,13 @@ func (q *Queries) FindCVVersionByHash(ctx context.Context, sha256Hash string) (C
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const findLatestCVVersionByFilename = `-- name: FindLatestCVVersionByFilename :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 WHERE original_filename = $1
 ORDER BY uploaded_at DESC
 LIMIT 1
@@ -180,12 +185,13 @@ func (q *Queries) FindLatestCVVersionByFilename(ctx context.Context, originalFil
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getCV = `-- name: GetCV :one
-SELECT id, name, tag, created_at, updated_at FROM cvs WHERE id = $1
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE id = $1
 `
 
 func (q *Queries) GetCV(ctx context.Context, id uuid.UUID) (Cv, error) {
@@ -197,12 +203,13 @@ func (q *Queries) GetCV(ctx context.Context, id uuid.UUID) (Cv, error) {
 		&i.Tag,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getCVByName = `-- name: GetCVByName :one
-SELECT id, name, tag, created_at, updated_at FROM cvs WHERE name = $1
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE name = $1
 `
 
 func (q *Queries) GetCVByName(ctx context.Context, name string) (Cv, error) {
@@ -214,12 +221,13 @@ func (q *Queries) GetCVByName(ctx context.Context, name string) (Cv, error) {
 		&i.Tag,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getCVVersion = `-- name: GetCVVersion :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions WHERE id = $1
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions WHERE id = $1
 `
 
 func (q *Queries) GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error) {
@@ -233,6 +241,7 @@ func (q *Queries) GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, er
 		&i.OriginalFilename,
 		&i.S3Key,
 		&i.UploadedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -261,7 +270,7 @@ func (q *Queries) GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCV
 }
 
 const listAllCVVersions = `-- name: ListAllCVVersions :many
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 ORDER BY cv_id, uploaded_at DESC
 `
 
@@ -282,6 +291,7 @@ func (q *Queries) ListAllCVVersions(ctx context.Context) ([]CvVersion, error) {
 			&i.OriginalFilename,
 			&i.S3Key,
 			&i.UploadedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -340,7 +350,7 @@ func (q *Queries) ListApplicationsUsingCVVersion(ctx context.Context, cvVersionI
 }
 
 const listCVs = `-- name: ListCVs :many
-SELECT id, name, tag, created_at, updated_at FROM cvs ORDER BY created_at DESC
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs ORDER BY created_at DESC
 `
 
 func (q *Queries) ListCVs(ctx context.Context) ([]Cv, error) {
@@ -358,6 +368,7 @@ func (q *Queries) ListCVs(ctx context.Context) ([]Cv, error) {
 			&i.Tag,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -370,7 +381,7 @@ func (q *Queries) ListCVs(ctx context.Context) ([]Cv, error) {
 }
 
 const listVersionsForCV = `-- name: ListVersionsForCV :many
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at FROM cv_versions
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
 WHERE cv_id = $1
 ORDER BY uploaded_at DESC
 `
@@ -392,6 +403,7 @@ func (q *Queries) ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVe
 			&i.OriginalFilename,
 			&i.S3Key,
 			&i.UploadedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}

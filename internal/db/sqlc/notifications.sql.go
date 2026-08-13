@@ -103,7 +103,7 @@ SET sent_at = $1::timestamptz
 WHERE id = $2
   AND sent_at IS NULL
   AND dismissed_at IS NULL
-RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated_at
+RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated_at, user_id
 `
 
 type MarkFollowUpReminderSentParams struct {
@@ -128,6 +128,7 @@ func (q *Queries) MarkFollowUpReminderSent(ctx context.Context, arg MarkFollowUp
 		&i.DismissedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }

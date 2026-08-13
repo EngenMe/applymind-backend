@@ -11,6 +11,10 @@ import (
 )
 
 type Querier interface {
+	// ---------------------------------------------------------------------------
+	// API tokens
+	// ---------------------------------------------------------------------------
+	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (ApiToken, error)
 	// Queries for the applications module. Run `sqlc generate` after adding this
 	// file; internal/db/sqlc/applications.sql.go and the additions to querier.go are
 	// generated from it.
@@ -33,8 +37,19 @@ type Querier interface {
 	// uq_follow_up_reminders_one_pending allows a single un-sent, un-dismissed
 	// reminder per application, so a re-save is a no-op rather than an error.
 	CreatePendingFollowUpReminder(ctx context.Context, arg CreatePendingFollowUpReminderParams) (FollowUpReminder, error)
+	// ---------------------------------------------------------------------------
+	// Sessions
+	// ---------------------------------------------------------------------------
+	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	// id, created_at and updated_at come from column defaults.
 	CreateSite(ctx context.Context, arg CreateSiteParams) (Site, error)
+	// Queries for the auth module.
+	//
+	// Neither sessions nor api_tokens is ever looked up by its raw token. The
+	// client holds the raw value; this stores only its SHA-256, and every lookup
+	// hashes what arrived before searching. A dump of this database yields no
+	// usable credentials.
+	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	// Cover letters, status history, reminders and recruiter contacts go with it via
 	// ON DELETE CASCADE.
 	DeleteApplication(ctx context.Context, id uuid.UUID) (int64, error)
@@ -42,6 +57,9 @@ type Querier interface {
 	// Used to implement replace-on-save. Deleting a row that is not there is a
 	// no-op, which is what the service relies on.
 	DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error
+	// Housekeeping, not authentication: expired rows are already unusable because
+	// every lookup filters them out. This only stops the table growing forever.
+	DeleteExpiredSessions(ctx context.Context) (int64, error)
 	// Fails with 23503 when applications still reference the site: the foreign key
 	// is ON DELETE RESTRICT. The pre-configured rule is enforced in the service
 	// layer, not here, per the ERD.
@@ -56,6 +74,9 @@ type Querier interface {
 	// Note this only guards the domain constraint; name is UNIQUE too, and a
 	// collision there surfaces as 23505.
 	EnsureSite(ctx context.Context, arg EnsureSiteParams) (Site, error)
+	// The sliding half of the 30-day window. Called only when the service decides
+	// enough time has passed to be worth a write.
+	ExtendSession(ctx context.Context, arg ExtendSessionParams) (Session, error)
 	// The MVP duplicate check: exact company name, ignoring case and surrounding
 	// whitespace. Embedding similarity is a later phase.
 	FindApplicationsByCompanyName(ctx context.Context, companyName string) ([]Application, error)
@@ -75,6 +96,14 @@ type Querier interface {
 	//
 	FindDueFollowUpReminders(ctx context.Context, arg FindDueFollowUpRemindersParams) ([]FindDueFollowUpRemindersRow, error)
 	FindLatestCVVersionByFilename(ctx context.Context, originalFilename string) (CvVersion, error)
+	// No expiry column: an API token lives until it is revoked. That is deliberate
+	// — the extension cannot prompt for a re-login, so a token that silently
+	// expired would look like the extension breaking.
+	FindLiveAPITokenByTokenHash(ctx context.Context, tokenHash string) (ApiToken, error)
+	// The hot path: every authenticated dashboard request runs this. Expiry and
+	// revocation are filtered here rather than in Go so that a stale row can never
+	// be authenticated by a caller that forgot to check.
+	FindLiveSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetApplication(ctx context.Context, id uuid.UUID) (Application, error)
 	GetCV(ctx context.Context, id uuid.UUID) (Cv, error)
 	GetCVByName(ctx context.Context, name string) (Cv, error)
@@ -86,6 +115,13 @@ type Querier interface {
 	// Resolves a captured page's domain to a site row. Returns pgx.ErrNoRows when
 	// the domain is not a configured site.
 	GetSiteByDomain(ctx context.Context, domain string) (Site, error)
+	GetUser(ctx context.Context, id uuid.UUID) (User, error)
+	// email is citext, so this is already case-insensitive at the database level.
+	// The service normalises anyway, so the two never disagree about what "the same
+	// address" means.
+	GetUserByEmail(ctx context.Context, email string) (User, error)
+	ListActiveAPITokens(ctx context.Context, userID uuid.UUID) ([]ApiToken, error)
+	ListActiveSessions(ctx context.Context, userID uuid.UUID) ([]Session, error)
 	// Returns every site the extension is currently allowed to capture from.
 	ListActiveSites(ctx context.Context) ([]Site, error)
 	ListAllCVVersions(ctx context.Context) ([]CvVersion, error)
@@ -116,6 +152,14 @@ type Querier interface {
 	// The service passes a lowercased, www-stripped host, so the stored value is
 	// normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
 	ResolveSiteByDomain(ctx context.Context, domain string) (Site, error)
+	RevokeAPIToken(ctx context.Context, arg RevokeAPITokenParams) (int64, error)
+	// "Sign out everywhere". Also the correct response to a password change.
+	RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) (int64, error)
+	// Scoped by user_id as well as id: a session id is a uuid the caller could have
+	// obtained anywhere, and revoking somebody else's session is not a feature.
+	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
+	// Logout. The caller presents a token rather than an id.
+	RevokeSessionByTokenHash(ctx context.Context, tokenHash string) (int64, error)
 	// ---------------------------------------------------------------------------
 	// PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
 	//
@@ -133,6 +177,9 @@ type Querier interface {
 	SetApplicationAIScore(ctx context.Context, arg SetApplicationAIScoreParams) (Application, error)
 	// updated_at is maintained by trg_sites_updated_at.
 	SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (Site, error)
+	// Best-effort, called after a successful match. A failure here must never fail
+	// the request it was authenticating.
+	TouchAPIToken(ctx context.Context, id uuid.UUID) error
 	// Captured job data only. Status never moves here — that is
 	// UpdateApplicationStatus, so no transition can skip the audit trail.
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (Application, error)
@@ -144,6 +191,7 @@ type Querier interface {
 	// actually sent and is immutable; without this predicate the row-level check
 	// constraint would reject the write anyway, but with a far less useful error.
 	UpdateCoverLetterText(ctx context.Context, arg UpdateCoverLetterTextParams) (CoverLetter, error)
+	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error)
 	// Upsert rather than update: if the row seeded by migration 000011 is ever
 	// missing, the first write puts it back instead of failing forever.
 	UpsertProfileSummary(ctx context.Context, profileSummary *string) (Setting, error)

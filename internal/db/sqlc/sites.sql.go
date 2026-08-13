@@ -14,7 +14,7 @@ import (
 const createSite = `-- name: CreateSite :one
 INSERT INTO sites (name, domain, is_preconfigured, is_active)
 VALUES ($1, $2, $3, $4)
-RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id
 `
 
 type CreateSiteParams struct {
@@ -42,6 +42,7 @@ func (q *Queries) CreateSite(ctx context.Context, arg CreateSiteParams) (Site, e
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -66,7 +67,7 @@ const ensureSite = `-- name: EnsureSite :one
 INSERT INTO sites (name, domain, is_preconfigured, is_active)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (domain) DO NOTHING
-RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id
 `
 
 type EnsureSiteParams struct {
@@ -99,12 +100,13 @@ func (q *Queries) EnsureSite(ctx context.Context, arg EnsureSiteParams) (Site, e
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getSite = `-- name: GetSite :one
-SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 WHERE id = $1
 `
 
@@ -120,12 +122,13 @@ func (q *Queries) GetSite(ctx context.Context, id uuid.UUID) (Site, error) {
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getSiteByDomain = `-- name: GetSiteByDomain :one
-SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 WHERE domain = $1
 `
 
@@ -143,12 +146,13 @@ func (q *Queries) GetSiteByDomain(ctx context.Context, domain string) (Site, err
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const listActiveSites = `-- name: ListActiveSites :many
-SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 WHERE is_active = true
 ORDER BY name
 `
@@ -172,6 +176,7 @@ func (q *Queries) ListActiveSites(ctx context.Context) ([]Site, error) {
 			&i.Selectors,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -184,7 +189,7 @@ func (q *Queries) ListActiveSites(ctx context.Context) ([]Site, error) {
 }
 
 const listSites = `-- name: ListSites :many
-SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 ORDER BY name
 `
 
@@ -208,6 +213,7 @@ func (q *Queries) ListSites(ctx context.Context) ([]Site, error) {
 			&i.Selectors,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -223,7 +229,7 @@ const setSiteActive = `-- name: SetSiteActive :one
 UPDATE sites
 SET is_active = $2
 WHERE id = $1
-RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at
+RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id
 `
 
 type SetSiteActiveParams struct {
@@ -244,6 +250,7 @@ func (q *Queries) SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (S
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }

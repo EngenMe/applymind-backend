@@ -7,6 +7,7 @@ package db
 import (
 	"database/sql/driver"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/google/uuid"
@@ -148,6 +149,17 @@ func (ns NullStatusChangeSource) Value() (driver.Value, error) {
 	return string(ns.StatusChangeSource), nil
 }
 
+type ApiToken struct {
+	ID         uuid.UUID  `json:"id"`
+	UserID     uuid.UUID  `json:"user_id"`
+	TokenHash  string     `json:"token_hash"`
+	Name       string     `json:"name"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	RevokedAt  *time.Time `json:"revoked_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	IsReadOnly bool       `json:"is_read_only"`
+}
+
 type Application struct {
 	ID                 uuid.UUID         `json:"id"`
 	CompanyName        string            `json:"company_name"`
@@ -162,6 +174,7 @@ type Application struct {
 	AppliedAt          *time.Time        `json:"applied_at"`
 	CreatedAt          time.Time         `json:"created_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
+	UserID             uuid.UUID         `json:"user_id"`
 }
 
 type ApplicationStatusHistory struct {
@@ -172,6 +185,7 @@ type ApplicationStatusHistory struct {
 	ChangedBy     StatusChangeSource `json:"changed_by"`
 	Note          *string            `json:"note"`
 	ChangedAt     time.Time          `json:"changed_at"`
+	UserID        uuid.UUID          `json:"user_id"`
 }
 
 type CoverLetter struct {
@@ -183,6 +197,7 @@ type CoverLetter struct {
 	OriginalFilename *string         `json:"original_filename"`
 	CreatedAt        time.Time       `json:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at"`
+	UserID           uuid.UUID       `json:"user_id"`
 }
 
 type Cv struct {
@@ -191,6 +206,7 @@ type Cv struct {
 	Tag       *string   `json:"tag"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 type CvVersion struct {
@@ -201,6 +217,7 @@ type CvVersion struct {
 	OriginalFilename string    `json:"original_filename"`
 	S3Key            string    `json:"s3_key"`
 	UploadedAt       time.Time `json:"uploaded_at"`
+	UserID           uuid.UUID `json:"user_id"`
 }
 
 type FollowUpReminder struct {
@@ -211,6 +228,7 @@ type FollowUpReminder struct {
 	DismissedAt   *time.Time `json:"dismissed_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	UserID        uuid.UUID  `json:"user_id"`
 }
 
 type RecruiterContact struct {
@@ -222,6 +240,18 @@ type RecruiterContact struct {
 	Notes         *string   `json:"notes"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	UserID        uuid.UUID `json:"user_id"`
+}
+
+type Session struct {
+	ID        uuid.UUID   `json:"id"`
+	UserID    uuid.UUID   `json:"user_id"`
+	TokenHash string      `json:"token_hash"`
+	ExpiresAt time.Time   `json:"expires_at"`
+	RevokedAt *time.Time  `json:"revoked_at"`
+	UserAgent *string     `json:"user_agent"`
+	IpAddress *netip.Addr `json:"ip_address"`
+	CreatedAt time.Time   `json:"created_at"`
 }
 
 type Setting struct {
@@ -232,12 +262,23 @@ type Setting struct {
 }
 
 type Site struct {
-	ID              uuid.UUID `json:"id"`
-	Name            string    `json:"name"`
-	Domain          string    `json:"domain"`
-	IsPreconfigured bool      `json:"is_preconfigured"`
-	IsActive        bool      `json:"is_active"`
-	Selectors       []byte    `json:"selectors"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              uuid.UUID  `json:"id"`
+	Name            string     `json:"name"`
+	Domain          string     `json:"domain"`
+	IsPreconfigured bool       `json:"is_preconfigured"`
+	IsActive        bool       `json:"is_active"`
+	Selectors       []byte     `json:"selectors"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	UserID          *uuid.UUID `json:"user_id"`
+}
+
+type User struct {
+	ID              uuid.UUID  `json:"id"`
+	Email           string     `json:"email"`
+	PasswordHash    string     `json:"password_hash"`
+	DisplayName     *string    `json:"display_name"`
+	EmailVerifiedAt *time.Time `json:"email_verified_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }

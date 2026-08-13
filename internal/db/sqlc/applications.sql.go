@@ -20,7 +20,7 @@ INSERT INTO applications (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
-RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at
+RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
 type CreateApplicationParams struct {
@@ -65,6 +65,7 @@ func (q *Queries) CreateApplication(ctx context.Context, arg CreateApplicationPa
 		&i.AppliedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -75,7 +76,7 @@ INSERT INTO application_status_history (
 ) VALUES (
     $1, $2, $3, $4, $5
 )
-RETURNING id, application_id, from_status, to_status, changed_by, note, changed_at
+RETURNING id, application_id, from_status, to_status, changed_by, note, changed_at, user_id
 `
 
 type CreateApplicationStatusHistoryParams struct {
@@ -103,6 +104,7 @@ func (q *Queries) CreateApplicationStatusHistory(ctx context.Context, arg Create
 		&i.ChangedBy,
 		&i.Note,
 		&i.ChangedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -112,7 +114,7 @@ INSERT INTO follow_up_reminders (application_id, due_at)
 VALUES ($1, $2)
 ON CONFLICT (application_id) WHERE sent_at IS NULL AND dismissed_at IS NULL
 DO NOTHING
-RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated_at
+RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated_at, user_id
 `
 
 type CreatePendingFollowUpReminderParams struct {
@@ -133,6 +135,7 @@ func (q *Queries) CreatePendingFollowUpReminder(ctx context.Context, arg CreateP
 		&i.DismissedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -167,7 +170,7 @@ func (q *Queries) DismissPendingFollowUpReminders(ctx context.Context, applicati
 }
 
 const findApplicationsByCompanyName = `-- name: FindApplicationsByCompanyName :many
-SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at FROM applications
+SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications
 WHERE lower(btrim(company_name)) = lower(btrim($1::text))
 ORDER BY COALESCE(applied_at, created_at) DESC
 `
@@ -197,6 +200,7 @@ func (q *Queries) FindApplicationsByCompanyName(ctx context.Context, companyName
 			&i.AppliedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -209,7 +213,7 @@ func (q *Queries) FindApplicationsByCompanyName(ctx context.Context, companyName
 }
 
 const getApplication = `-- name: GetApplication :one
-SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at FROM applications WHERE id = $1
+SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications WHERE id = $1
 `
 
 func (q *Queries) GetApplication(ctx context.Context, id uuid.UUID) (Application, error) {
@@ -229,12 +233,13 @@ func (q *Queries) GetApplication(ctx context.Context, id uuid.UUID) (Application
 		&i.AppliedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const listApplicationStatusHistory = `-- name: ListApplicationStatusHistory :many
-SELECT id, application_id, from_status, to_status, changed_by, note, changed_at FROM application_status_history
+SELECT id, application_id, from_status, to_status, changed_by, note, changed_at, user_id FROM application_status_history
 WHERE application_id = $1
 ORDER BY changed_at ASC
 `
@@ -256,6 +261,7 @@ func (q *Queries) ListApplicationStatusHistory(ctx context.Context, applicationI
 			&i.ChangedBy,
 			&i.Note,
 			&i.ChangedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -268,7 +274,7 @@ func (q *Queries) ListApplicationStatusHistory(ctx context.Context, applicationI
 }
 
 const listApplications = `-- name: ListApplications :many
-SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at FROM applications
+SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications
 WHERE ($1::application_status IS NULL OR status = $1::application_status)
   AND ($2::uuid IS NULL OR site_id = $2::uuid)
   AND ($3::uuid IS NULL OR cv_version_id = $3::uuid)
@@ -333,6 +339,7 @@ func (q *Queries) ListApplications(ctx context.Context, arg ListApplicationsPara
 			&i.AppliedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -345,7 +352,7 @@ func (q *Queries) ListApplications(ctx context.Context, arg ListApplicationsPara
 }
 
 const resolveSiteByDomain = `-- name: ResolveSiteByDomain :one
-SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at FROM sites
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 WHERE is_active = true
   AND regexp_replace(lower(btrim(domain)), '^www\.', '') = $1::text
 LIMIT 1
@@ -370,6 +377,7 @@ func (q *Queries) ResolveSiteByDomain(ctx context.Context, domain string) (Site,
 		&i.Selectors,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -381,7 +389,7 @@ SET ai_score             = $1,
     ai_score_explanation = $2,
     updated_at           = now()
 WHERE id = $3
-RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at
+RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
 type SetApplicationAIScoreParams struct {
@@ -421,6 +429,7 @@ func (q *Queries) SetApplicationAIScore(ctx context.Context, arg SetApplicationA
 		&i.AppliedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -434,7 +443,7 @@ SET company_name    = $2,
     site_id         = $6,
     cv_version_id   = $7
 WHERE id = $1
-RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at
+RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
 type UpdateApplicationParams struct {
@@ -474,6 +483,7 @@ func (q *Queries) UpdateApplication(ctx context.Context, arg UpdateApplicationPa
 		&i.AppliedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -483,7 +493,7 @@ UPDATE applications
 SET status     = $1,
     applied_at = COALESCE(applications.applied_at, $2::timestamptz)
 WHERE id = $3
-RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at
+RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
 type UpdateApplicationStatusParams struct {
@@ -512,6 +522,7 @@ func (q *Queries) UpdateApplicationStatus(ctx context.Context, arg UpdateApplica
 		&i.AppliedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UserID,
 	)
 	return i, err
 }

@@ -24,3 +24,95 @@
 - `RESEND_API_KEY` / actual email delivery — MVP notification delivery is the structured log line read via `GET /notifications/due`, per `cmd/scheduler/main.go`. Nothing currently sends real email.
 - `CORS_ALLOWED_ORIGINS` and the S3 CORS rule both currently default to `http://localhost:3000` (or whatever's in your `.env`). Update and redeploy once the Vercel dashboard and the extension have real origins.
 - VPC / private networking to Neon — not used; out of scope per the phase's Aurora note.
+
+## Environment variables
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | yes in deployed envs | Comma-separated, explicit origins. **`*` is rejected at startup.** The API now sends credentials, and a browser refuses a wildcard alongside them. |
+| `APPLYMIND_COOKIE_SECURE` | no | Defaults to `true`. Set `false` only for local plain-http development. A `Secure` cookie is silently dropped over http, which presents as "login works, then I am immediately logged out". |
+
+## 1. Migrate
+
+```bash
+make migrate-up   # applies 000016_read_only_tokens_and_demo_user
+```
+
+Verify:
+
+```sql
+\d api_tokens                                     -- is_read_only boolean not null default false
+SELECT email, display_name FROM users;            -- seed account + demo@applymind.faroukhasnaoui.tech
+```
+
+## 2. Set the seed account's password
+
+The seed account's `password_hash` is a deliberate invalid placeholder, so nothing
+can log in as it until this runs. The password comes from stdin, not a flag — a
+flag would put it in the process table and in shell history.
+
+```bash
+read -rs -p 'password: ' PW && printf '%s' "$PW" | go run ./cmd/setpassword -email mohamdfarouk727@gmail.com
+```
+
+If the database is only reachable from somewhere else, generate the hash locally
+and apply it by hand:
+
+```bash
+read -rs -p 'password: ' PW && printf '%s' "$PW" | go run ./cmd/setpassword -hash-only
+```
+
+```sql
+UPDATE users SET password_hash = '<hash>', updated_at = now()
+WHERE email = 'mohamdfarouk727@gmail.com';
+```
+
+Verify: `POST /auth/login` with those credentials returns 200 and a
+`applymind_session` cookie.
+
+## 3. Issue the demo account's read-only token
+
+> **This token must be created by hand, and that is deliberate.**
+> The demo account's `password_hash` is unusable on purpose — it has no
+> interactive login and must never acquire one. It therefore cannot call
+> `POST /auth/tokens` itself, and the fix for that is *not* to give the demo
+> account a working password: doing so quietly creates an interactive login for
+> a shared, publicly-demoed account. Insert the token row directly instead.
+
+```bash
+RAW=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')   # base64url, matches generateToken
+HASH=$(printf '%s' "$RAW" | openssl dgst -sha256 -hex | awk '{print $2}')
+echo "$RAW"   # the only time this value exists — store it server-side, never in the browser
+```
+
+```sql
+INSERT INTO api_tokens (user_id, token_hash, name, is_read_only)
+SELECT id, '<HASH>', 'demo dashboard (read-only)', true
+FROM users WHERE email = 'demo@applymind.faroukhasnaoui.tech';
+```
+
+Verify, with `$RAW`:
+
+```bash
+curl -i -H "Authorization: Bearer $RAW" "$API/auth/me"                  # 200
+curl -i -X POST -H "Authorization: Bearer $RAW" "$API/auth/tokens"      # 403 {"error":"read_only_token"}
+```
+
+The dashboard holds this token server-side from phase 16. It is never sent to a
+browser.
+
+## 4. Post-deploy verification
+
+```bash
+curl -i "$API/health"                                    # 200, no credential
+curl -i "$API/auth/me"                                   # 401 {"error":"unauthorized"}
+curl -i -H "Authorization: Bearer $APPLYMIND_API_KEY" "$API/applications"   # 200 — still the static key this phase
+```
+
+## Known for phase 15
+
+- The existing module group still runs on `LegacyStaticKeyAuth`. Phase 15 flips
+  it to `RequireAuth` and deletes the legacy function in the same change that
+  makes the queries user-aware.
+- `seeds/seed-demo-data.sql` still has no `user_id`. It is re-run against the
+  demo account in phase 15, once the modules are user-aware.

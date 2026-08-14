@@ -1,4 +1,4 @@
-.PHONY: migrate-up migrate-down migrate-drop migrate-version migrate-create sqlc test run-api run-scheduler \
+.PHONY: migrate-up migrate-down migrate-drop migrate-version migrate-create sqlc build test run-api run-scheduler \
 	build-api build-scheduler build-lambdas cdk-bootstrap cdk-synth cdk-diff cdk-deploy cdk-destroy
 
 # Migrations run against the DIRECT (non-pooled) Neon endpoint. golang-migrate
@@ -27,6 +27,16 @@ migrate-create:
 
 sqlc:
 	sqlc generate
+
+# Compiles every package for the host platform, including the ones with no
+# tests — cmd/api, cmd/setpassword, pkg/config, pkg/storage and the rest. `make
+# test` builds those too as a side effect of `go test ./...`, but it reports
+# them as "no test files", which reads as "nothing happened" rather than "this
+# compiles". Vet runs alongside because the mistakes it catches (a printf verb
+# that doesn't match its argument, a lost struct tag) compile perfectly well.
+build:
+	go build ./...
+	go vet ./...
 
 test:
 	go test ./...

@@ -66,7 +66,7 @@ func (q *Queries) DeleteSite(ctx context.Context, id uuid.UUID) (int64, error) {
 const ensureSite = `-- name: EnsureSite :one
 INSERT INTO sites (name, domain, is_preconfigured, is_active)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (domain) DO NOTHING
+ON CONFLICT (domain) WHERE user_id IS NULL DO NOTHING
 RETURNING id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id
 `
 
@@ -80,6 +80,18 @@ type EnsureSiteParams struct {
 // Idempotent insert used to seed the pre-configured list on boot. DO NOTHING
 // means no row is returned when the domain is already registered, which the
 // repository reads as "nothing to do" rather than an error.
+//
+// The WHERE clause on the conflict target is load-bearing. Migration 000015
+// replaced the plain unique(domain) with two rescoped constraints — one on
+// (user_id, domain), and a partial unique index on (domain) that applies only
+// to the global rows, where user_id IS NULL. Postgres will not infer a partial
+// index as an arbiter unless the statement restates its predicate, so a bare
+// ON CONFLICT (domain) matches no constraint at all and fails at runtime with
+// 42P10 rather than at generate time.
+//
+// This insert leaves user_id to its default of NULL, so the row it writes is a
+// global one and does fall under that index. Pre-configured sites belong to
+// nobody by design: every user sees LinkedIn, and only custom sites are owned.
 //
 // Note this only guards the domain constraint; name is UNIQUE too, and a
 // collision there surfaces as 23505.

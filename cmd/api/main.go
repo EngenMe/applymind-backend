@@ -5,12 +5,15 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 7 adds the settings module and, when an OpenAI key is configured, the
-// GPT-4o-mini job-match score on application save.
+// Phase 14 adds the auth module: /auth/register and /auth/login are public,
+// the rest of /auth/* resolves a real user from a session cookie or an API
+// token. The existing module group deliberately stays on the static key for
+// one more phase — see the comment on that group.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -29,6 +32,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/EngenMe/applymind-backend/internal/applications"
+	"github.com/EngenMe/applymind-backend/internal/auth"
 	"github.com/EngenMe/applymind-backend/internal/coverletters"
 	"github.com/EngenMe/applymind-backend/internal/cvs"
 	sqlcdb "github.com/EngenMe/applymind-backend/internal/db/sqlc"
@@ -117,6 +121,13 @@ func main() {
 		slog.Warn("OPENAI_API_KEY is not set — applications will be saved without an ai match score")
 	}
 
+	if !cfg.CookieSecure {
+		// Worth a line in the log, because a session cookie without Secure
+		// travels over plain http. Expected locally and nowhere else, so the
+		// warning is what makes it visible if it ever ships.
+		slog.Warn("session cookies are being issued without the Secure flag — local http development only")
+	}
+
 	router := newRouter(cfg, pool, queries, cvStore, siteSvc, scorer, logger)
 
 	if isLambda() {
@@ -158,23 +169,75 @@ func newRouter(
 	r.Use(
 		cors.Handler(
 			cors.Options{
-				AllowedOrigins:   cfg.CORSAllowedOrigins,
-				AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-				AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-				AllowCredentials: false,
+				AllowedOrigins: cfg.CORSAllowedOrigins,
+				AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+				AllowedHeaders: []string{"Accept", "Authorization", "Content-Type"},
+				// Required from phase 14: the dashboard authenticates with the
+				// applymind_session cookie, and a browser will neither send nor
+				// store it cross-origin unless credentials are allowed. Without
+				// this, login appears to succeed and every request after it is
+				// a 401.
+				//
+				// The cost is that AllowedOrigins can never be "*" — a browser
+				// refuses a wildcard alongside credentials. config.Load rejects
+				// "*" at startup so that constraint fails next to the env var
+				// that broke it rather than in a browser console.
+				AllowCredentials: true,
 				MaxAge:           300,
 			},
 		),
 	)
 
 	// Unauthenticated: used to confirm the process is up and the database is
-	// reachable. Kept outside the API key group so an uptime check does not
-	// need to hold a credential.
+	// reachable. Kept outside every auth group so an uptime check does not need
+	// to hold a credential.
 	r.Get("/health", healthHandler(pool))
+
+	authSvc := auth.NewService(auth.NewRepository(queries))
+	authHandler := auth.NewHandler(authSvc, logger, auth.WithSecureCookies(cfg.CookieSecure))
+
+	// Public: the two endpoints that cannot require a session, because they are
+	// how a session is obtained.
+	authHandler.RegisterPublicRoutes(r)
+
+	// Everything else under /auth/* resolves a real user — cookie for the
+	// dashboard, bearer token for the extension.
+	r.Group(
+		func(authed chi.Router) {
+			authed.Use(middleware.RequireAuth(authSvc, logger))
+			authHandler.RegisterProtectedRoutes(authed, middleware.UserIDFromRequest)
+		},
+	)
+
+	// chi bakes a group's middleware onto each handler it registers, not onto
+	// the router as a whole. A method with no registered handler anywhere —
+	// this API has no PUT route at all, for instance — never reaches
+	// RequireAuth; chi answers 405 straight out of its routing tree first,
+	// with an Allow header that discloses which methods do exist at that
+	// path. That is more than a read-only credential should learn, and the
+	// phase's own test list requires a write attempt to get the same 403
+	// read_only_token a supported write gets, regardless of whether a handler
+	// happens to exist. This is the one place that has to run before routing
+	// decides a method doesn't exist, which is why it is wired at the Mux
+	// root rather than inside a group.
+	//
+	// Every credential that is not a read-only token — no credential, the
+	// static key, a full-access session or token — is unaffected: this only
+	// changes the response when CheckReadOnlyWrite's own identity resolution
+	// succeeds and finds IsReadOnly, and it costs one DB lookup, so it only
+	// runs at all when a request actually presents something that looks like
+	// a credential.
+	r.MethodNotAllowed(readOnlyMethodNotAllowed(authSvc))
 
 	r.Group(
 		func(protected chi.Router) {
-			protected.Use(middleware.APIKeyAuth(cfg.APIKey))
+			// Still the static key, deliberately, for exactly this phase. The
+			// modules below ignore user_id: putting them behind RequireAuth now
+			// would identify the caller and then serve them every user's rows,
+			// which is a worse outcome than the shared key. Phase 15 makes
+			// these queries user-aware and flips this group over in the same
+			// change, which is also when LegacyStaticKeyAuth is deleted.
+			protected.Use(middleware.LegacyStaticKeyAuth(cfg.APIKey))
 
 			cvSvc := cvs.NewService(cvs.NewRepository(queries), cvStore)
 			cvs.NewHandler(cvSvc, logger).RegisterRoutes(protected)
@@ -223,6 +286,25 @@ func newRouter(
 	)
 
 	return r
+}
+
+// readOnlyMethodNotAllowed is the router-wide fallback for a method that has
+// no handler registered at that path anywhere in the app. See the comment
+// where this is wired in newRouter for why it has to live here rather than
+// inside the auth group.
+func readOnlyMethodNotAllowed(authSvc auth.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if middleware.CheckReadOnlyWrite(r, authSvc) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "read_only_token"})
+			return
+		}
+		// Everyone else — no credential, the static key, a full-access
+		// session or token — sees chi's ordinary response: unchanged from
+		// before this existed.
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+	}
 }
 
 func healthHandler(pool *pgxpool.Pool) http.HandlerFunc {

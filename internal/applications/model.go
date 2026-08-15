@@ -256,9 +256,12 @@ type ListFilter struct {
 	Offset      int
 }
 
-// NewApplication is the repository-level input for inserting an application row.
+// NewApplication is the repository-level input for inserting an application
+// row. UserID is set by the service from the authenticated caller, never from
+// client input.
 type NewApplication struct {
 	ID             uuid.UUID
+	UserID         uuid.UUID
 	CompanyName    string
 	JobTitle       string
 	JobDescription string
@@ -280,9 +283,11 @@ type UpdateFields struct {
 	CVVersionID    *uuid.UUID
 }
 
-// NewStatusHistory is the repository-level input for one audit row.
+// NewStatusHistory is the repository-level input for one audit row. UserID is
+// set by the service from the authenticated caller, mirroring NewApplication.
 type NewStatusHistory struct {
 	ApplicationID uuid.UUID
+	UserID        uuid.UUID
 	FromStatus    *Status
 	ToStatus      Status
 	ChangedBy     ChangeSource
@@ -311,13 +316,12 @@ var (
 	// ErrSiteUnresolvable means no site_id was supplied and the job url has no
 	// host to derive one from.
 	ErrSiteUnresolvable = errors.New("applications: could not determine the site from the job url")
-	// ErrSiteNotFound means the site_id does not exist, or no active site is
-	// registered for the job url's domain.
+	// ErrSiteNotFound means the site_id does not exist, is not active, or does
+	// not belong to this user (and is not global).
 	ErrSiteNotFound      = errors.New("applications: site not found")
 	ErrCVVersionNotFound = errors.New("applications: cv version not found")
-	// ErrDuplicateJobURL is the unique(site_id, job_url) constraint: this exact
-	// posting has already been saved. Distinct from DuplicateWarning, which is
-	// the soft company-name check.
+	// ErrDuplicateJobURL is the unique(user_id, site_id, job_url) constraint:
+	// this exact posting has already been saved by this user.
 	ErrDuplicateJobURL = errors.New("applications: this job url has already been saved for this site")
 	// ErrCoverLettersUnavailable is a wiring error: a cover letter was supplied
 	// but the service was constructed without the coverletters dependency.

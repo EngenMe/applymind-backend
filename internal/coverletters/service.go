@@ -25,20 +25,27 @@ type Storage interface {
 // There is no matching, hashing or version selection here: a cover letter
 // belongs to exactly one application, so the application id is always the whole
 // question and saving is always a replace.
+//
+// Phase 15: every method takes the caller's userID. This module's routes are
+// mounted independently of the applications module's, so nothing upstream
+// confirms the caller owns application_id before it reaches here — the
+// CreateCoverLetter query's WHERE EXISTS guard (see queries/cover_letters.sql)
+// is what actually enforces it; userID reaching every method is what makes that
+// guard possible to apply.
 type Service interface {
 	// SaveText stores a typed cover letter, replacing any existing one.
-	SaveText(ctx context.Context, in SaveTextInput) (*CoverLetter, error)
+	SaveText(ctx context.Context, userID uuid.UUID, in SaveTextInput) (*CoverLetter, error)
 	// SaveFile validates the extension, stores the file in S3 and records the
 	// row, replacing any existing cover letter.
-	SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter, error)
+	SaveFile(ctx context.Context, userID uuid.UUID, in SaveFileInput) (*CoverLetter, error)
 	// EditText rewrites the body of a text cover letter in place. It returns
 	// ErrNotTextKind for a file cover letter.
-	EditText(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error)
+	EditText(ctx context.Context, userID, applicationID uuid.UUID, body string) (*CoverLetter, error)
 	// Get returns the cover letter for an application, whichever kind it is.
-	Get(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error)
+	Get(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error)
 	// DownloadURL presigns the stored object. It returns ErrNotFileKind for a
 	// text cover letter, which has nothing stored.
-	DownloadURL(ctx context.Context, applicationID uuid.UUID) (*DownloadLink, error)
+	DownloadURL(ctx context.Context, userID, applicationID uuid.UUID) (*DownloadLink, error)
 }
 
 const (
@@ -94,13 +101,13 @@ func NewService(repo Repository, store Storage, opts ...ServiceOption) Service {
 	return s
 }
 
-func (s *service) SaveText(ctx context.Context, in SaveTextInput) (*CoverLetter, error) {
+func (s *service) SaveText(ctx context.Context, userID uuid.UUID, in SaveTextInput) (*CoverLetter, error) {
 	body := strings.TrimSpace(in.BodyText)
 	if body == "" {
 		return nil, ErrEmptyBody
 	}
 
-	if err := s.clearExisting(ctx, in.ApplicationID); err != nil {
+	if err := s.clearExisting(ctx, userID, in.ApplicationID); err != nil {
 		return nil, err
 	}
 
@@ -108,13 +115,14 @@ func (s *service) SaveText(ctx context.Context, in SaveTextInput) (*CoverLetter,
 		ctx, NewCoverLetter{
 			ID:            s.newID(),
 			ApplicationID: in.ApplicationID,
+			UserID:        userID,
 			Kind:          KindText,
 			BodyText:      &body,
 		},
 	)
 }
 
-func (s *service) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter, error) {
+func (s *service) SaveFile(ctx context.Context, userID uuid.UUID, in SaveFileInput) (*CoverLetter, error) {
 	filename := strings.TrimSpace(in.Filename)
 	if filename == "" {
 		return nil, ErrFilenameEmpty
@@ -137,7 +145,7 @@ func (s *service) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter,
 		return nil, ErrFileTooLarge
 	}
 
-	if err := s.clearExisting(ctx, in.ApplicationID); err != nil {
+	if err := s.clearExisting(ctx, userID, in.ApplicationID); err != nil {
 		return nil, err
 	}
 
@@ -151,6 +159,7 @@ func (s *service) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter,
 		ctx, NewCoverLetter{
 			ID:               id,
 			ApplicationID:    in.ApplicationID,
+			UserID:           userID,
 			Kind:             KindFile,
 			S3Key:            &key,
 			OriginalFilename: &filename,
@@ -158,20 +167,24 @@ func (s *service) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter,
 	)
 	if err != nil {
 		// Best effort: do not leave an object in S3 with no row pointing at it.
-		// This is also the path taken when application_id does not exist.
+		// This is also the path taken when application_id does not exist, or
+		// belongs to somebody else.
 		_ = s.storage.Delete(ctx, key)
 		return nil, err
 	}
 	return cl, nil
 }
 
-func (s *service) EditText(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error) {
+func (s *service) EditText(ctx context.Context, userID, applicationID uuid.UUID, body string) (
+	*CoverLetter,
+	error,
+) {
 	trimmed := strings.TrimSpace(body)
 	if trimmed == "" {
 		return nil, ErrEmptyBody
 	}
 
-	existing, err := s.repo.GetByApplicationID(ctx, applicationID)
+	existing, err := s.repo.GetByApplicationID(ctx, userID, applicationID)
 	if err != nil {
 		return nil, err
 	}
@@ -182,15 +195,15 @@ func (s *service) EditText(ctx context.Context, applicationID uuid.UUID, body st
 		return nil, ErrNotTextKind
 	}
 
-	return s.repo.UpdateTextBody(ctx, applicationID, trimmed)
+	return s.repo.UpdateTextBody(ctx, userID, applicationID, trimmed)
 }
 
-func (s *service) Get(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error) {
-	return s.repo.GetByApplicationID(ctx, applicationID)
+func (s *service) Get(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error) {
+	return s.repo.GetByApplicationID(ctx, userID, applicationID)
 }
 
-func (s *service) DownloadURL(ctx context.Context, applicationID uuid.UUID) (*DownloadLink, error) {
-	cl, err := s.repo.GetByApplicationID(ctx, applicationID)
+func (s *service) DownloadURL(ctx context.Context, userID, applicationID uuid.UUID) (*DownloadLink, error) {
+	cl, err := s.repo.GetByApplicationID(ctx, userID, applicationID)
 	if err != nil {
 		return nil, err
 	}
@@ -212,8 +225,8 @@ func (s *service) DownloadURL(ctx context.Context, applicationID uuid.UUID) (*Do
 // clearExisting removes whatever cover letter the application already has, so
 // that a save is a replace. unique(application_id) means an insert could not
 // succeed otherwise, and this module deliberately keeps no history.
-func (s *service) clearExisting(ctx context.Context, applicationID uuid.UUID) error {
-	existing, err := s.repo.GetByApplicationID(ctx, applicationID)
+func (s *service) clearExisting(ctx context.Context, userID, applicationID uuid.UUID) error {
+	existing, err := s.repo.GetByApplicationID(ctx, userID, applicationID)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -221,7 +234,7 @@ func (s *service) clearExisting(ctx context.Context, applicationID uuid.UUID) er
 		return err
 	}
 
-	if err := s.repo.DeleteByApplicationID(ctx, applicationID); err != nil {
+	if err := s.repo.DeleteByApplicationID(ctx, userID, applicationID); err != nil {
 		return err
 	}
 	// Best effort, and only after the row is gone: a failed delete here leaves

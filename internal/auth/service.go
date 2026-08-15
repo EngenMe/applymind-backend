@@ -75,6 +75,19 @@ const (
 	// produces "Password1!" and a user who has written it on something.
 	MinPasswordLength = 12
 
+	// MaxPasswordLength is bcrypt's limit, not a policy of ours: the algorithm
+	// reads at most 72 bytes and the rest of the input has no effect on the
+	// hash. Checked here rather than left to bcrypt because the two things it
+	// does at that boundary — return ErrPasswordTooLong on current x/crypto,
+	// truncate silently on older ones — are both wrong to pass through. The
+	// first becomes a 500 for a user who did what the minimum encouraged; the
+	// second means "hunter2...<72 bytes>...anything" and the same prefix with a
+	// different tail are the same credential.
+	//
+	// Bytes, not runes, because that is the unit bcrypt counts: a 30-character
+	// passphrase in a non-Latin script can exceed this.
+	MaxPasswordLength = 72
+
 	// tokenBytes is the entropy behind every session and API token. 32 bytes
 	// is 256 bits — not guessable, and not worth making configurable.
 	tokenBytes = 32
@@ -152,6 +165,9 @@ func (s *service) Register(ctx context.Context, in RegisterInput) (*AuthResult, 
 	if len([]rune(in.Password)) < MinPasswordLength {
 		return nil, ErrPasswordTooShort
 	}
+	if len(in.Password) > MaxPasswordLength {
+		return nil, ErrPasswordTooLong
+	}
 
 	// Checked here for a clear error, and enforced by the unique constraint
 	// underneath because this check races: two simultaneous registrations for
@@ -167,6 +183,13 @@ func (s *service) Register(ctx context.Context, in RegisterInput) (*AuthResult, 
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), s.bcryptCost)
 	if err != nil {
+		// The length check above should have caught this. Mapped anyway rather
+		// than wrapped, so that if the two ever disagree — a different bcrypt
+		// implementation, a changed limit — the caller still gets a 400 that
+		// names the problem instead of a 500 that does not.
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return nil, ErrPasswordTooLong
+		}
 		return nil, fmt.Errorf("auth: hash password: %w", err)
 	}
 
@@ -438,15 +461,28 @@ func hashToken(raw string) string {
 // The column is citext, so the database already treats case as insignificant.
 // Normalising here as well means the Go-side "does this exist" check and the
 // constraint can never disagree about what counts as the same address.
+// The address returned is the one mail.ParseAddress extracted, not the input.
+// ParseAddress accepts a full RFC 5322 mailbox — `Farouk <a@b.com>` parses
+// happily — and returning the input would store that entire string, display
+// name and angle brackets included, as the account's email. It would be unique,
+// it would be citext, and it would be wrong: nothing else in the system expects
+// an address it cannot send to.
 func normaliseEmail(raw string) (string, error) {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	if trimmed == "" {
 		return "", ErrEmailRequired
 	}
-	if _, err := mail.ParseAddress(trimmed); err != nil {
+	parsed, err := mail.ParseAddress(trimmed)
+	if err != nil {
 		return "", ErrEmailInvalid
 	}
-	return trimmed, nil
+	// ParseAddress does not lowercase, and the input may have been a mailbox
+	// whose address part escaped the earlier pass.
+	address := strings.ToLower(strings.TrimSpace(parsed.Address))
+	if address == "" {
+		return "", ErrEmailRequired
+	}
+	return address, nil
 }
 
 func trimmedOrNil(s *string) *string {

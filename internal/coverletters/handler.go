@@ -12,13 +12,15 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
 // Handler exposes the coverletters module over HTTP via chi, matching the
-// router set up in cmd/api/main.go. Register it inside the API-key-protected
+// router set up in cmd/api/main.go. Register it inside the authenticated
 // group:
 //
-//	coverletters.NewHandler(clSvc, logger).RegisterRoutes(protected)
+//	coverletters.NewHandler(clSvc, logger).RegisterRoutes(authed)
 type Handler struct {
 	svc            Service
 	logger         *slog.Logger
@@ -42,6 +44,21 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 // pathParam is the single point of coupling to the router.
 func (h *Handler) pathParam(r *http.Request, name string) string {
 	return chi.URLParam(r, name)
+}
+
+// requireUser reads the authenticated caller. See the identical helper in
+// internal/auth and internal/cvs for why a missing user here is a 500, not a 401.
+func (h *Handler) requireUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		h.logger.ErrorContext(
+			r.Context(), "coverletters: no user in context on a protected route",
+			slog.String("path", r.URL.Path),
+		)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "something went wrong")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 // ---------------------------------------------------------------------------
@@ -85,25 +102,29 @@ type downloadResponse struct {
 // An application has at most one cover letter, so a save replaces whatever was
 // there before, including deleting the previous file from S3.
 func (h *Handler) Save(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	applicationID, ok := h.parseUUIDParam(w, r, "id", "invalid_application_id")
 	if !ok {
 		return
 	}
 
 	if isMultipart(r) {
-		h.saveFile(w, r, applicationID)
+		h.saveFile(w, r, userID, applicationID)
 		return
 	}
-	h.saveText(w, r, applicationID)
+	h.saveText(w, r, userID, applicationID)
 }
 
-func (h *Handler) saveText(w http.ResponseWriter, r *http.Request, applicationID uuid.UUID) {
+func (h *Handler) saveText(w http.ResponseWriter, r *http.Request, userID, applicationID uuid.UUID) {
 	req, ok := h.decodeTextRequest(w, r)
 	if !ok {
 		return
 	}
 
-	cl, err := h.svc.SaveText(r.Context(), SaveTextInput{
+	cl, err := h.svc.SaveText(r.Context(), userID, SaveTextInput{
 		ApplicationID: applicationID,
 		BodyText:      req.BodyText,
 	})
@@ -114,7 +135,7 @@ func (h *Handler) saveText(w http.ResponseWriter, r *http.Request, applicationID
 	h.writeJSON(w, http.StatusCreated, toResponse(*cl))
 }
 
-func (h *Handler) saveFile(w http.ResponseWriter, r *http.Request, applicationID uuid.UUID) {
+func (h *Handler) saveFile(w http.ResponseWriter, r *http.Request, userID, applicationID uuid.UUID) {
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadBytes+1024)
 	if err := r.ParseMultipartForm(h.maxUploadBytes); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -146,7 +167,7 @@ func (h *Handler) saveFile(w http.ResponseWriter, r *http.Request, applicationID
 		return
 	}
 
-	cl, err := h.svc.SaveFile(r.Context(), SaveFileInput{
+	cl, err := h.svc.SaveFile(r.Context(), userID, SaveFileInput{
 		ApplicationID: applicationID,
 		Filename:      header.Filename,
 		Content:       content,
@@ -163,12 +184,16 @@ func (h *Handler) saveFile(w http.ResponseWriter, r *http.Request, applicationID
 // Returns the body for a text cover letter, or the filename plus the path to
 // call for a download URL for a file one.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	applicationID, ok := h.parseUUIDParam(w, r, "id", "invalid_application_id")
 	if !ok {
 		return
 	}
 
-	cl, err := h.svc.Get(r.Context(), applicationID)
+	cl, err := h.svc.Get(r.Context(), userID, applicationID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -182,6 +207,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // Text cover letters only. A file cover letter is a record of what was actually
 // sent, so it cannot be edited in place — replacing it is a POST.
 func (h *Handler) EditText(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	applicationID, ok := h.parseUUIDParam(w, r, "id", "invalid_application_id")
 	if !ok {
 		return
@@ -191,7 +220,7 @@ func (h *Handler) EditText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cl, err := h.svc.EditText(r.Context(), applicationID, req.BodyText)
+	cl, err := h.svc.EditText(r.Context(), userID, applicationID, req.BodyText)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -203,12 +232,16 @@ func (h *Handler) EditText(w http.ResponseWriter, r *http.Request) {
 // Returns a short-lived presigned S3 URL as JSON rather than redirecting, so
 // the extension and dashboard can both decide what to do with it. File kind only.
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	applicationID, ok := h.parseUUIDParam(w, r, "id", "invalid_application_id")
 	if !ok {
 		return
 	}
 
-	link, err := h.svc.DownloadURL(r.Context(), applicationID)
+	link, err := h.svc.DownloadURL(r.Context(), userID, applicationID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return

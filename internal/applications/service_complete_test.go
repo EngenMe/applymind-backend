@@ -14,6 +14,9 @@ import (
 // Phase 13's own fakes. Named apart from the ones in service_test.go so both
 // files can live in the package; if the existing fake repository grows the
 // methods used here, delete this one and use that instead.
+//
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too.
 
 type p13Repo struct {
 	app       *Application
@@ -25,6 +28,13 @@ type p13Repo struct {
 	history   []NewStatusHistory
 	reminders []time.Time
 	dismissed int
+
+	// cvVersionOwned controls what CVVersionOwnedByUser answers. Defaults to
+	// true (owned) so existing tests that attach a cv_version_id do not have to
+	// know this check exists — it is a phase 15 addition, not something Flow
+	// 2's own tests were written to exercise.
+	cvVersionOwned bool
+	cvVersionSet   bool
 }
 
 func (r *p13Repo) Tx(ctx context.Context, fn func(Repository) error) error { return fn(r) }
@@ -45,16 +55,18 @@ func (r *p13Repo) Create(ctx context.Context, in NewApplication) (*Application, 
 	return r.snapshot(), nil
 }
 
-func (r *p13Repo) Get(ctx context.Context, id uuid.UUID) (*Application, error) {
+func (r *p13Repo) Get(ctx context.Context, userID, id uuid.UUID) (*Application, error) {
 	if r.app == nil || r.app.ID != id {
 		return nil, ErrNotFound
 	}
 	return r.snapshot(), nil
 }
 
-func (r *p13Repo) List(ctx context.Context, f ListFilter) ([]Application, error) { return nil, nil }
+func (r *p13Repo) List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Application, error) {
+	return nil, nil
+}
 
-func (r *p13Repo) Update(ctx context.Context, id uuid.UUID, in UpdateFields) (*Application, error) {
+func (r *p13Repo) Update(ctx context.Context, userID, id uuid.UUID, in UpdateFields) (*Application, error) {
 	if r.app == nil || r.app.ID != id {
 		return nil, ErrNotFound
 	}
@@ -70,7 +82,7 @@ func (r *p13Repo) Update(ctx context.Context, id uuid.UUID, in UpdateFields) (*A
 
 func (r *p13Repo) UpdateStatus(
 	ctx context.Context,
-	id uuid.UUID,
+	userID, id uuid.UUID,
 	status Status,
 	appliedAt *time.Time,
 ) (*Application, error) {
@@ -85,18 +97,18 @@ func (r *p13Repo) UpdateStatus(
 	return r.snapshot(), nil
 }
 
-func (r *p13Repo) Delete(ctx context.Context, id uuid.UUID) error {
+func (r *p13Repo) Delete(ctx context.Context, userID, id uuid.UUID) error {
 	r.app = nil
 	return nil
 }
 
-func (r *p13Repo) FindByCompanyName(ctx context.Context, company string) ([]Application, error) {
+func (r *p13Repo) FindByCompanyName(ctx context.Context, userID uuid.UUID, company string) ([]Application, error) {
 	return r.byCompany, nil
 }
 
 func (r *p13Repo) SetAIScore(
 	ctx context.Context,
-	id uuid.UUID,
+	userID, id uuid.UUID,
 	score float64,
 	explanation *string,
 ) (*Application, error) {
@@ -110,22 +122,40 @@ func (r *p13Repo) CreateStatusHistory(ctx context.Context, in NewStatusHistory) 
 	return &StatusHistory{ID: uuid.New(), ApplicationID: in.ApplicationID, ToStatus: in.ToStatus}, nil
 }
 
-func (r *p13Repo) ListStatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHistory, error) {
+func (r *p13Repo) ListStatusHistory(ctx context.Context, userID, id uuid.UUID) ([]StatusHistory, error) {
 	return nil, nil
 }
 
-func (r *p13Repo) EnsurePendingReminder(ctx context.Context, id uuid.UUID, dueAt time.Time) error {
+func (r *p13Repo) EnsurePendingReminder(ctx context.Context, userID, id uuid.UUID, dueAt time.Time) error {
 	r.reminders = append(r.reminders, dueAt)
 	return nil
 }
 
-func (r *p13Repo) DismissPendingReminders(ctx context.Context, id uuid.UUID) error {
+func (r *p13Repo) DismissPendingReminders(ctx context.Context, userID, id uuid.UUID) error {
 	r.dismissed++
 	return nil
 }
 
-func (r *p13Repo) FindSiteByDomain(ctx context.Context, domain string) (*Site, error) {
+func (r *p13Repo) FindSiteByDomain(ctx context.Context, userID uuid.UUID, domain string) (*Site, error) {
 	return r.site, nil
+}
+
+// FindSiteByID is unused by every test in this file: none of them supply an
+// explicit site_id on CreateInput, so resolveSiteID never reaches it. It
+// exists only to satisfy Repository.
+func (r *p13Repo) FindSiteByID(ctx context.Context, userID, id uuid.UUID) (*Site, error) {
+	return r.site, nil
+}
+
+// CVVersionOwnedByUser defaults to true (owned) so a test that attaches a
+// cv_version_id — the whole point of Flow 2 — is not silently rejected by a
+// phase 15 ownership check it was never written to know about. Set
+// cvVersionOwned/cvVersionSet explicitly to exercise the rejection path.
+func (r *p13Repo) CVVersionOwnedByUser(ctx context.Context, userID, cvVersionID uuid.UUID) (bool, error) {
+	if r.cvVersionSet {
+		return r.cvVersionOwned, nil
+	}
+	return true, nil
 }
 
 func (r *p13Repo) snapshot() *Application {
@@ -142,6 +172,7 @@ type p13CoverLetters struct {
 
 func (c *p13CoverLetters) SaveText(
 	ctx context.Context,
+	userID uuid.UUID,
 	in coverletters.SaveTextInput,
 ) (*coverletters.CoverLetter, error) {
 	if c.err != nil {
@@ -178,7 +209,7 @@ func TestCompleteAppliesTheApplicationAndStartsTheFollowUpClock(t *testing.T) {
 
 	body := "Dear Acme, …"
 	result, err := svc.Complete(
-		context.Background(), id, CompleteInput{
+		context.Background(), testUserID, id, CompleteInput{
 			CVVersionID:     &cvVersionID,
 			CoverLetterText: &body,
 		},
@@ -235,7 +266,7 @@ func TestCompleteHonoursAnExplicitCompletedAt(t *testing.T) {
 	repo := inProgressRepo(id, siteID)
 	svc := NewService(repo, nil, WithClock(func() time.Time { return now }))
 
-	result, err := svc.Complete(context.Background(), id, CompleteInput{CompletedAt: &sent})
+	result, err := svc.Complete(context.Background(), testUserID, id, CompleteInput{CompletedAt: &sent})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -253,7 +284,9 @@ func TestCompleteRejectsAnApplicationThatHasAlreadyBeenSent(t *testing.T) {
 	repo.app.Status = StatusApplied
 	svc := NewService(repo, nil)
 
-	if _, err := svc.Complete(context.Background(), id, CompleteInput{}); !errors.Is(err, ErrAlreadyCompleted) {
+	if _, err := svc.Complete(
+		context.Background(), testUserID, id, CompleteInput{},
+	); !errors.Is(err, ErrAlreadyCompleted) {
 		t.Fatalf("error = %v, want ErrAlreadyCompleted", err)
 	}
 	if len(repo.reminders) != 0 || len(repo.history) != 0 {
@@ -268,7 +301,9 @@ func TestCompleteLeavesTheApplicationInProgressWhenTheCoverLetterFails(t *testin
 	svc := NewService(repo, letters)
 
 	body := "Dear Acme, …"
-	if _, err := svc.Complete(context.Background(), id, CompleteInput{CoverLetterText: &body}); err == nil {
+	if _, err := svc.Complete(
+		context.Background(), testUserID, id, CompleteInput{CoverLetterText: &body},
+	); err == nil {
 		t.Fatal("Complete succeeded despite the cover letter failing")
 	}
 
@@ -302,7 +337,7 @@ func TestCreateSavesTheApplicationEvenWhenItIsADuplicate(t *testing.T) {
 	svc := NewService(repo, nil)
 
 	result, err := svc.Create(
-		context.Background(), CreateInput{
+		context.Background(), testUserID, CreateInput{
 			CompanyName: "Acme",
 			JobTitle:    "Backend Engineer (Go)",
 			JobURL:      "https://www.linkedin.com/jobs/view/456/",
@@ -346,7 +381,7 @@ func TestCheckDuplicateFlagsTheSameJobFoundOnAnotherSite(t *testing.T) {
 	svc := NewService(repo, nil)
 
 	warning, err := svc.CheckDuplicate(
-		context.Background(), DuplicateQuery{
+		context.Background(), testUserID, DuplicateQuery{
 			Company:  "  acme ",
 			JobTitle: "Senior Backend Engineer — Payments",
 			SiteID:   &greenhouse,
@@ -375,7 +410,7 @@ func TestCheckDuplicateWithoutATitleReportsOnlyCompanyMatches(t *testing.T) {
 	}
 	svc := NewService(repo, nil)
 
-	warning, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: "Acme"})
+	warning, err := svc.CheckDuplicate(context.Background(), testUserID, DuplicateQuery{Company: "Acme"})
 	if err != nil {
 		t.Fatalf("CheckDuplicate: %v", err)
 	}
@@ -391,7 +426,7 @@ func TestCheckDuplicateIsSilentForANewCompany(t *testing.T) {
 	svc := NewService(&p13Repo{}, nil)
 
 	warning, err := svc.CheckDuplicate(
-		context.Background(),
+		context.Background(), testUserID,
 		DuplicateQuery{Company: "Acme", JobTitle: "Backend Engineer"},
 	)
 	if err != nil {

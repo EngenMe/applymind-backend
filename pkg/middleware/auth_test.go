@@ -15,130 +15,6 @@ import (
 	"github.com/EngenMe/applymind-backend/internal/auth"
 )
 
-const testKey = "test-secret-key-12345"
-
-func newProtectedHandler(t *testing.T) http.Handler {
-	t.Helper()
-	next := http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		},
-	)
-	return LegacyStaticKeyAuth(testKey)(next)
-}
-
-func TestLegacyStaticKeyAuth_ValidKey_Passes(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	req.Header.Set("Authorization", "Bearer "+testKey)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_MissingHeader_Rejects(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_WrongKey_Rejects(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	req.Header.Set("Authorization", "Bearer wrong-key")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_MissingBearerPrefix_Rejects(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	// Raw key with no "Bearer " prefix must be rejected, not silently
-	// tolerated — the prefix is part of the contract, not decoration.
-	req.Header.Set("Authorization", testKey)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_EmptyBearerValue_Rejects(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	req.Header.Set("Authorization", "Bearer ")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_KeyIsPrefixOfExpected_Rejects(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	// A key that is a truncated prefix of the real one must still fail —
-	// guards against a naive strings.HasPrefix-style comparison bug.
-	req.Header.Set("Authorization", "Bearer "+testKey[:len(testKey)-1])
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestLegacyStaticKeyAuth_UnauthorizedBody_IsJSON(t *testing.T) {
-	handler := newProtectedHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-		t.Fatalf("expected application/json content type, got %q", ct)
-	}
-	if rec.Body.Len() == 0 {
-		t.Fatal("expected a JSON error body, got empty response")
-	}
-}
-
-func TestLegacyStaticKeyAuth_EmptyExpectedKey_Panics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected LegacyStaticKeyAuth(\"\") to panic, it did not")
-		}
-	}()
-	LegacyStaticKeyAuth("")
-}
-
 // ---------------------------------------------------------------------------
 // RequireAuth
 // ---------------------------------------------------------------------------
@@ -616,4 +492,90 @@ func TestRequireAuth_NilService_Panics(t *testing.T) {
 		}
 	}()
 	RequireAuth(nil, discardLogger())
+}
+
+// ---------------------------------------------------------------------------
+// CheckReadOnlyWrite (the router's MethodNotAllowed fallback)
+// ---------------------------------------------------------------------------
+
+func TestCheckReadOnlyWrite_ReadOnlyTokenWriting(t *testing.T) {
+	svc := &stubAuthService{
+		t: t,
+		token: func(context.Context, string) (*auth.Identity, error) {
+			return tokenIdentity(uuid.New(), true), nil
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/applications/x", nil)
+	req.Header.Set("Authorization", "Bearer demo-token")
+
+	if !CheckReadOnlyWrite(req, svc) {
+		t.Fatal("a read-only token on an unregistered write method must be reported, or it gets chi's 405 and its Allow header")
+	}
+}
+
+// A safe method cannot be a read-only violation, so it must not cost a lookup:
+// this runs on the 405 path, where the request is already going nowhere.
+func TestCheckReadOnlyWrite_SafeMethodResolvesNothing(t *testing.T) {
+	svc := &stubAuthService{
+		t: t,
+		token: func(context.Context, string) (*auth.Identity, error) {
+			return tokenIdentity(uuid.New(), true), nil
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/applications", nil)
+	req.Header.Set("Authorization", "Bearer demo-token")
+
+	if CheckReadOnlyWrite(req, svc) {
+		t.Error("a GET is never a read-only violation")
+	}
+	if len(svc.bearerTokens) != 0 {
+		t.Errorf("resolved the credential %d time(s) for a safe method", len(svc.bearerTokens))
+	}
+}
+
+// A session is never read-only, so the cookie path cannot change the answer —
+// and resolving it would cost a session lookup, a user lookup and possibly a
+// sliding-expiry write on a request that is about to 405.
+func TestCheckReadOnlyWrite_CookieShortCircuitsWithoutResolving(t *testing.T) {
+	svc := &stubAuthService{
+		t: t,
+		token: func(context.Context, string) (*auth.Identity, error) {
+			return tokenIdentity(uuid.New(), true), nil
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/applications/x", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "live-session"})
+	req.Header.Set("Authorization", "Bearer demo-token")
+
+	if CheckReadOnlyWrite(req, svc) {
+		t.Error("a request carrying a session cookie must not be judged by its bearer token — RequireAuth would resolve it as the session")
+	}
+	if len(svc.sessionTokens) != 0 || len(svc.bearerTokens) != 0 {
+		t.Errorf(
+			"resolved credentials on the cookie path: %d session, %d bearer lookups, want 0 and 0",
+			len(svc.sessionTokens), len(svc.bearerTokens),
+		)
+	}
+}
+
+func TestCheckReadOnlyWrite_FullAccessTokenAndNoCredential(t *testing.T) {
+	full := &stubAuthService{
+		t: t,
+		token: func(context.Context, string) (*auth.Identity, error) {
+			return tokenIdentity(uuid.New(), false), nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/applications", nil)
+	req.Header.Set("Authorization", "Bearer real-token")
+	if CheckReadOnlyWrite(req, full) {
+		t.Error("a full-access token is not a read-only violation")
+	}
+
+	bare := &stubAuthService{t: t}
+	if CheckReadOnlyWrite(httptest.NewRequest(http.MethodPost, "/applications", nil), bare) {
+		t.Error("an unauthenticated request must fall through to chi's ordinary 405")
+	}
 }

@@ -16,31 +16,36 @@ import (
 // when the row is absent, because the caller asked for something specific.
 // Find* returns (nil, nil) when nothing matches, because "no match" is a normal
 // branch of the Flow 3 decision tree rather than an error.
+//
+// Phase 15: every method takes a userID and every query is scoped by it. A
+// version another user owns is not merely off-limits to serve — under Get* it
+// must read as "not found", not "found, but not yours", because the second
+// answer confirms the row exists to someone who should not be able to tell.
 type Repository interface {
-	CreateCV(ctx context.Context, name string, tag *string) (*CV, error)
-	GetCV(ctx context.Context, id uuid.UUID) (*CV, error)
-	GetCVByName(ctx context.Context, name string) (*CV, error)
-	ListCVs(ctx context.Context) ([]CV, error)
-	DeleteCV(ctx context.Context, id uuid.UUID) error
+	CreateCV(ctx context.Context, userID uuid.UUID, name string, tag *string) (*CV, error)
+	GetCV(ctx context.Context, userID, id uuid.UUID) (*CV, error)
+	GetCVByName(ctx context.Context, userID uuid.UUID, name string) (*CV, error)
+	ListCVs(ctx context.Context, userID uuid.UUID) ([]CV, error)
+	DeleteCV(ctx context.Context, userID, id uuid.UUID) error
 
 	CreateVersion(ctx context.Context, in NewVersion) (*CVVersion, error)
-	GetVersion(ctx context.Context, id uuid.UUID) (*CVVersion, error)
-	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error)
-	ListAllVersions(ctx context.Context) ([]CVVersion, error)
+	GetVersion(ctx context.Context, userID, id uuid.UUID) (*CVVersion, error)
+	ListVersionsForCV(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error)
+	ListAllVersions(ctx context.Context, userID uuid.UUID) ([]CVVersion, error)
 
 	// FindVersionByHash implements Flow 3, Decision 2.
-	FindVersionByHash(ctx context.Context, hash string) (*CVVersion, error)
+	FindVersionByHash(ctx context.Context, userID uuid.UUID, hash string) (*CVVersion, error)
 	// FindLatestVersionByFilename implements Flow 3, Decision 3.
-	FindLatestVersionByFilename(ctx context.Context, filename string) (*CVVersion, error)
+	FindLatestVersionByFilename(ctx context.Context, userID uuid.UUID, filename string) (*CVVersion, error)
 	// FindVersionByCVAndSize implements Flow 3, Decision 4.
-	FindVersionByCVAndSize(ctx context.Context, cvID uuid.UUID, size int64) (*CVVersion, error)
-	// FindVersionByCVAndHash guards the unique(cv_id, sha256_hash) constraint.
-	FindVersionByCVAndHash(ctx context.Context, cvID uuid.UUID, hash string) (*CVVersion, error)
+	FindVersionByCVAndSize(ctx context.Context, userID, cvID uuid.UUID, size int64) (*CVVersion, error)
+	// FindVersionByCVAndHash guards the unique(user_id, cv_id, sha256_hash) constraint.
+	FindVersionByCVAndHash(ctx context.Context, userID, cvID uuid.UUID, hash string) (*CVVersion, error)
 
-	ListApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error)
+	ListApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) ([]ApplicationUsage, error)
 	// LastUsageForCV returns the most recent application that used any version of
 	// this CV, or (nil, nil) if it has never been used.
-	LastUsageForCV(ctx context.Context, cvID uuid.UUID) (*ApplicationUsage, error)
+	LastUsageForCV(ctx context.Context, userID, cvID uuid.UUID) (*ApplicationUsage, error)
 }
 
 // postgresRepository is the sqlc-backed implementation.
@@ -59,11 +64,12 @@ func NewRepository(q *sqlcdb.Queries) Repository {
 	return &postgresRepository{q: q}
 }
 
-func (r *postgresRepository) CreateCV(ctx context.Context, name string, tag *string) (*CV, error) {
+func (r *postgresRepository) CreateCV(ctx context.Context, userID uuid.UUID, name string, tag *string) (*CV, error) {
 	row, err := r.q.CreateCV(
 		ctx, sqlcdb.CreateCVParams{
-			Name: name,
-			Tag:  tag,
+			UserID: userID,
+			Name:   name,
+			Tag:    tag,
 		},
 	)
 	if err != nil {
@@ -73,8 +79,8 @@ func (r *postgresRepository) CreateCV(ctx context.Context, name string, tag *str
 	return &cv, nil
 }
 
-func (r *postgresRepository) GetCV(ctx context.Context, id uuid.UUID) (*CV, error) {
-	row, err := r.q.GetCV(ctx, id)
+func (r *postgresRepository) GetCV(ctx context.Context, userID, id uuid.UUID) (*CV, error) {
+	row, err := r.q.GetCV(ctx, sqlcdb.GetCVParams{ID: id, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrCVNotFound
@@ -85,8 +91,8 @@ func (r *postgresRepository) GetCV(ctx context.Context, id uuid.UUID) (*CV, erro
 	return &cv, nil
 }
 
-func (r *postgresRepository) GetCVByName(ctx context.Context, name string) (*CV, error) {
-	row, err := r.q.GetCVByName(ctx, name)
+func (r *postgresRepository) GetCVByName(ctx context.Context, userID uuid.UUID, name string) (*CV, error) {
+	row, err := r.q.GetCVByName(ctx, sqlcdb.GetCVByNameParams{UserID: userID, Name: name})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrCVNotFound
@@ -97,8 +103,8 @@ func (r *postgresRepository) GetCVByName(ctx context.Context, name string) (*CV,
 	return &cv, nil
 }
 
-func (r *postgresRepository) ListCVs(ctx context.Context) ([]CV, error) {
-	rows, err := r.q.ListCVs(ctx)
+func (r *postgresRepository) ListCVs(ctx context.Context, userID uuid.UUID) ([]CV, error) {
+	rows, err := r.q.ListCVs(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -109,14 +115,15 @@ func (r *postgresRepository) ListCVs(ctx context.Context) ([]CV, error) {
 	return out, nil
 }
 
-func (r *postgresRepository) DeleteCV(ctx context.Context, id uuid.UUID) error {
-	return r.q.DeleteCV(ctx, id)
+func (r *postgresRepository) DeleteCV(ctx context.Context, userID, id uuid.UUID) error {
+	return r.q.DeleteCV(ctx, sqlcdb.DeleteCVParams{ID: id, UserID: userID})
 }
 
 func (r *postgresRepository) CreateVersion(ctx context.Context, in NewVersion) (*CVVersion, error) {
 	row, err := r.q.CreateCVVersion(
 		ctx, sqlcdb.CreateCVVersionParams{
 			ID:               in.ID,
+			UserID:           in.UserID,
 			CvID:             in.CVID,
 			Sha256Hash:       in.SHA256Hash,
 			FileSizeBytes:    in.FileSizeBytes,
@@ -131,8 +138,8 @@ func (r *postgresRepository) CreateVersion(ctx context.Context, in NewVersion) (
 	return &v, nil
 }
 
-func (r *postgresRepository) GetVersion(ctx context.Context, id uuid.UUID) (*CVVersion, error) {
-	row, err := r.q.GetCVVersion(ctx, id)
+func (r *postgresRepository) GetVersion(ctx context.Context, userID, id uuid.UUID) (*CVVersion, error) {
+	row, err := r.q.GetCVVersion(ctx, sqlcdb.GetCVVersionParams{ID: id, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrVersionNotFound
@@ -143,63 +150,81 @@ func (r *postgresRepository) GetVersion(ctx context.Context, id uuid.UUID) (*CVV
 	return &v, nil
 }
 
-func (r *postgresRepository) ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error) {
-	rows, err := r.q.ListVersionsForCV(ctx, cvID)
+func (r *postgresRepository) ListVersionsForCV(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error) {
+	rows, err := r.q.ListVersionsForCV(ctx, sqlcdb.ListVersionsForCVParams{CvID: cvID, UserID: userID})
 	if err != nil {
 		return nil, err
 	}
 	return toDomainVersions(rows), nil
 }
 
-func (r *postgresRepository) ListAllVersions(ctx context.Context) ([]CVVersion, error) {
-	rows, err := r.q.ListAllCVVersions(ctx)
+func (r *postgresRepository) ListAllVersions(ctx context.Context, userID uuid.UUID) ([]CVVersion, error) {
+	rows, err := r.q.ListAllCVVersions(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	return toDomainVersions(rows), nil
 }
 
-func (r *postgresRepository) FindVersionByHash(ctx context.Context, hash string) (*CVVersion, error) {
-	row, err := r.q.FindCVVersionByHash(ctx, hash)
+func (r *postgresRepository) FindVersionByHash(ctx context.Context, userID uuid.UUID, hash string) (
+	*CVVersion,
+	error,
+) {
+	row, err := r.q.FindCVVersionByHash(ctx, sqlcdb.FindCVVersionByHashParams{UserID: userID, Sha256Hash: hash})
 	return firstVersionOrNil(row, err)
 }
 
-func (r *postgresRepository) FindLatestVersionByFilename(ctx context.Context, filename string) (*CVVersion, error) {
-	row, err := r.q.FindLatestCVVersionByFilename(ctx, filename)
+func (r *postgresRepository) FindLatestVersionByFilename(ctx context.Context, userID uuid.UUID, filename string) (
+	*CVVersion,
+	error,
+) {
+	row, err := r.q.FindLatestCVVersionByFilename(
+		ctx, sqlcdb.FindLatestCVVersionByFilenameParams{
+			UserID:           userID,
+			OriginalFilename: filename,
+		},
+	)
 	return firstVersionOrNil(row, err)
 }
 
-func (r *postgresRepository) FindVersionByCVAndSize(ctx context.Context, cvID uuid.UUID, size int64) (
+func (r *postgresRepository) FindVersionByCVAndSize(ctx context.Context, userID, cvID uuid.UUID, size int64) (
 	*CVVersion,
 	error,
 ) {
 	row, err := r.q.FindCVVersionByCVAndSize(
 		ctx, sqlcdb.FindCVVersionByCVAndSizeParams{
 			CvID:          cvID,
+			UserID:        userID,
 			FileSizeBytes: size,
 		},
 	)
 	return firstVersionOrNil(row, err)
 }
 
-func (r *postgresRepository) FindVersionByCVAndHash(ctx context.Context, cvID uuid.UUID, hash string) (
+func (r *postgresRepository) FindVersionByCVAndHash(ctx context.Context, userID, cvID uuid.UUID, hash string) (
 	*CVVersion,
 	error,
 ) {
 	row, err := r.q.FindCVVersionByCVAndHash(
 		ctx, sqlcdb.FindCVVersionByCVAndHashParams{
 			CvID:       cvID,
+			UserID:     userID,
 			Sha256Hash: hash,
 		},
 	)
 	return firstVersionOrNil(row, err)
 }
 
-func (r *postgresRepository) ListApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) (
+func (r *postgresRepository) ListApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) (
 	[]ApplicationUsage,
 	error,
 ) {
-	rows, err := r.q.ListApplicationsUsingCVVersion(ctx, &versionID)
+	rows, err := r.q.ListApplicationsUsingCVVersion(
+		ctx, sqlcdb.ListApplicationsUsingCVVersionParams{
+			CvVersionID: &versionID,
+			UserID:      userID,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -218,8 +243,8 @@ func (r *postgresRepository) ListApplicationsUsingVersion(ctx context.Context, v
 	return out, nil
 }
 
-func (r *postgresRepository) LastUsageForCV(ctx context.Context, cvID uuid.UUID) (*ApplicationUsage, error) {
-	row, err := r.q.GetLastCVUsage(ctx, cvID)
+func (r *postgresRepository) LastUsageForCV(ctx context.Context, userID, cvID uuid.UUID) (*ApplicationUsage, error) {
+	row, err := r.q.GetLastCVUsage(ctx, sqlcdb.GetLastCVUsageParams{CvID: cvID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

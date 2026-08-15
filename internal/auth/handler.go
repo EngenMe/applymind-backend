@@ -33,6 +33,26 @@ type Handler struct {
 // because the middleware reads it too.
 const SessionCookieName = "applymind_session"
 
+// SessionCookieMaxAge is how long the browser is asked to keep the cookie, and
+// it is deliberately far longer than DefaultSessionTTL rather than equal to it.
+//
+// The session's expiry slides forward in the database every time it is used. A
+// cookie pinned to the expiry the session had at login does not slide, so after
+// thirty days the browser discards a cookie whose row is still perfectly alive:
+// somebody who opens the dashboard every single day is logged out on day 30,
+// which is the exact outcome the sliding window exists to prevent.
+//
+// The alternative fix is to re-issue the cookie whenever the session is
+// extended, which means the middleware writing Set-Cookie onto arbitrary
+// responses, including ones the extension makes and ignores. This is simpler
+// and keeps expiry in one place: the database decides when a session ends, and
+// the cookie's only job is to outlive that decision. A cookie left over from a
+// dead session is harmless — it fails its lookup and gets a 401.
+//
+// 400 days because that is the ceiling Chrome silently clamps to; asking for
+// more just gets less, quietly.
+const SessionCookieMaxAge = 400 * 24 * time.Hour
+
 type HandlerOption func(*Handler)
 
 // WithSecureCookies sets the Secure flag on the session cookie.
@@ -129,10 +149,13 @@ type apiTokenResponse struct {
 	// at two tokens needs to know which one can write.
 	ReadOnly   bool       `json:"read_only"`
 	LastUsedAt *time.Time `json:"last_used_at"`
-	// Revoked tokens stay in the list — hiding one makes it look as though it
-	// never existed, which is the opposite of what an audit list is for.
-	RevokedAt *time.Time `json:"revoked_at"`
-	CreatedAt time.Time  `json:"created_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	// There is no revoked_at here on purpose. ListActiveAPITokens filters
+	// revoked rows out in SQL, so the field could only ever serialise as null —
+	// a client would reasonably read that as "no token has ever been revoked".
+	// Showing revoked tokens as an audit trail is a real feature and a better
+	// one than a permanently-null field, but it needs the query to return them;
+	// until it does, the honest response is to omit it.
 }
 
 // issuedTokenResponse is the only response that ever carries a raw token. The
@@ -169,7 +192,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.setSessionCookie(w, result.SessionToken, result.Session.ExpiresAt)
+	h.setSessionCookie(w, result.SessionToken)
 	h.writeJSON(w, http.StatusCreated, map[string]any{"user": toUserResponse(*result.User)})
 }
 
@@ -193,7 +216,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.setSessionCookie(w, result.SessionToken, result.Session.ExpiresAt)
+	h.setSessionCookie(w, result.SessionToken)
 	h.writeJSON(w, http.StatusOK, map[string]any{"user": toUserResponse(*result.User)})
 }
 
@@ -353,13 +376,16 @@ func (h *Handler) RevokeToken(userIDFrom UserIDFunc) http.HandlerFunc {
 // following a link into the dashboard from the extension — and arriving
 // logged-out from your own link is a worse failure than the narrow CSRF surface
 // Lax leaves open on top-level GETs.
-func (h *Handler) setSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
+//
+// The lifetime is deliberately not the session's expiry. See
+// SessionCookieMaxAge.
+func (h *Handler) setSessionCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(
 		w, &http.Cookie{
 			Name:     SessionCookieName,
 			Value:    token,
 			Path:     "/",
-			Expires:  expiresAt,
+			MaxAge:   int(SessionCookieMaxAge / time.Second),
 			HttpOnly: true,
 			Secure:   h.secureCookies,
 			SameSite: http.SameSiteLaxMode,
@@ -483,7 +509,6 @@ func toAPITokenResponse(token APIToken) apiTokenResponse {
 		Name:       token.Name,
 		ReadOnly:   token.IsReadOnly,
 		LastUsedAt: token.LastUsedAt,
-		RevokedAt:  token.RevokedAt,
 		CreatedAt:  token.CreatedAt,
 	}
 }
@@ -512,6 +537,14 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		h.writeError(
 			w, http.StatusBadRequest, "password_too_short",
 			"password must be at least 12 characters",
+		)
+	case errors.Is(err, ErrPasswordTooLong):
+		// 400, not 500. A user who read "longer is better" and pasted a
+		// passphrase deserves to be told the limit, not handed an internal
+		// error for doing the thing the minimum encouraged.
+		h.writeError(
+			w, http.StatusBadRequest, "password_too_long",
+			"password must be at most 72 bytes",
 		)
 	case errors.Is(err, ErrTokenNameEmpty):
 		h.writeError(w, http.StatusBadRequest, "name_required", "name is required")

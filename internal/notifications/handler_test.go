@@ -13,13 +13,22 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
+
+// testUserID is the caller every request in this file is authenticated as.
+// These tests exercise request/response shape, not multi-tenancy, so one
+// fixed id is enough — see middleware.TestContextWithUserID for why a real
+// RequireAuth middleware isn't in front of these requests at all.
+var testUserID = uuid.New()
 
 type stubService struct {
 	notifications []Notification
 	err           error
 
 	checked bool
+	gotUser uuid.UUID
 }
 
 func (s *stubService) CheckReminders(context.Context) (*RunSummary, error) {
@@ -27,7 +36,8 @@ func (s *stubService) CheckReminders(context.Context) (*RunSummary, error) {
 	return &RunSummary{}, s.err
 }
 
-func (s *stubService) ListDue(context.Context) ([]Notification, error) {
+func (s *stubService) ListDue(_ context.Context, userID uuid.UUID) ([]Notification, error) {
+	s.gotUser = userID
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -43,7 +53,9 @@ func newTestHandler(svc Service) http.Handler {
 func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req = req.WithContext(middleware.TestContextWithUserID(req.Context(), testUserID))
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
@@ -74,6 +86,9 @@ func TestListDueReturnsNotifications(t *testing.T) {
 	rec := get(t, newTestHandler(svc), "/notifications/due")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if svc.gotUser != testUserID {
+		t.Errorf("userID passed to service = %s, want %s", svc.gotUser, testUserID)
 	}
 
 	var body struct {

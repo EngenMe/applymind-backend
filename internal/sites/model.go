@@ -86,7 +86,12 @@ type ListFilter struct {
 
 // NewSite is the repository-level input for inserting a site row, after the
 // service has trimmed the name and normalised the domain.
+//
+// UserID is nil only for the pre-configured rows Ensure writes at boot — every
+// row Create writes carries the caller's id, since a site added through the
+// API always belongs to whoever added it.
 type NewSite struct {
+	UserID          *uuid.UUID
 	Name            string
 	Domain          string
 	IsPreconfigured bool

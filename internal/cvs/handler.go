@@ -10,12 +10,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
 // Handler exposes the cvs module over HTTP via chi, matching the router set up
-// in cmd/api/main.go. Register it inside the API-key-protected group:
+// in cmd/api/main.go. Register it inside the authenticated group:
 //
-//	cvs.NewHandler(cvSvc, logger).RegisterRoutes(protected)
+//	cvs.NewHandler(cvSvc, logger).RegisterRoutes(authed)
 type Handler struct {
 	svc            Service
 	logger         *slog.Logger
@@ -40,6 +42,23 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 // pathParam is the single point of coupling to the router.
 func (h *Handler) pathParam(r *http.Request, name string) string {
 	return chi.URLParam(r, name)
+}
+
+// requireUser reads the authenticated caller. Reaching a handler behind
+// RequireAuth with no user in context is a wiring bug, not an authentication
+// failure — the middleware would already have rejected the request — so this
+// is a logged 500, matching the same convention in internal/auth.
+func (h *Handler) requireUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		h.logger.ErrorContext(
+			r.Context(), "cvs: no user in context on a protected route",
+			slog.String("path", r.URL.Path),
+		)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "something went wrong")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 // ---------------------------------------------------------------------------
@@ -108,13 +127,18 @@ type downloadResponse struct {
 // This endpoint never writes. When the outcome is new_version or unknown the
 // extension follows up with POST /cvs to store the file.
 func (h *Handler) Match(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	var req matchRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid_body", "request body must be valid JSON")
 		return
 	}
 
-	result, err := h.svc.Match(r.Context(), MatchQuery{
+	result, err := h.svc.Match(r.Context(), userID, MatchQuery{
 		SHA256Hash:    req.SHA256Hash,
 		Filename:      req.Filename,
 		FileSizeBytes: req.FileSizeBytes,
@@ -150,6 +174,11 @@ func (h *Handler) Match(w http.ResponseWriter, r *http.Request) {
 // Fields: file (required), cv_id (optional — attach as a new version of an
 // existing CV group), tag (optional, only used when creating a new group).
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadBytes+1024)
 	if err := r.ParseMultipartForm(h.maxUploadBytes); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -195,7 +224,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		in.Tag = &tag
 	}
 
-	result, err := h.svc.Upload(r.Context(), in)
+	result, err := h.svc.Upload(r.Context(), userID, in)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -214,7 +243,12 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 
 // List — GET /cvs (each CV with its full version history)
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	cvs, err := h.svc.ListWithVersions(r.Context())
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	cvs, err := h.svc.ListWithVersions(r.Context(), userID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -228,11 +262,15 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 // ListVersions — GET /cvs/{id}/versions
 func (h *Handler) ListVersions(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	cvID, ok := h.parseUUIDParam(w, r, "id", "invalid_cv_id")
 	if !ok {
 		return
 	}
-	versions, err := h.svc.ListVersions(r.Context(), cvID)
+	versions, err := h.svc.ListVersions(r.Context(), userID, cvID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -248,6 +286,10 @@ func (h *Handler) ListVersions(w http.ResponseWriter, r *http.Request) {
 // Returns a short-lived presigned S3 URL as JSON rather than redirecting, so the
 // extension and dashboard can both decide what to do with it.
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	cvID, ok := h.parseUUIDParam(w, r, "id", "invalid_cv_id")
 	if !ok {
 		return
@@ -257,7 +299,7 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	link, err := h.svc.DownloadURL(r.Context(), cvID, versionID)
+	link, err := h.svc.DownloadURL(r.Context(), userID, cvID, versionID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return

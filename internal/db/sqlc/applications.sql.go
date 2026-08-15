@@ -12,19 +12,51 @@ import (
 	"github.com/google/uuid"
 )
 
+const cVVersionOwnedByUser = `-- name: CVVersionOwnedByUser :one
+SELECT EXISTS (
+    SELECT 1 FROM cv_versions WHERE id = $1 AND user_id = $2
+) AS owned
+`
+
+type CVVersionOwnedByUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// A cheap pre-check so the service can tell an unowned/missing cv_version_id
+// apart from an unowned/missing site_id before either reaches the atomic
+// INSERT/UPDATE guard, which cannot distinguish the two once it collapses to
+// "no rows written". This query exists purely for that distinguishable error
+// message; the INSERT/UPDATE guards remain the actual enforcement against a
+// race between this check and the write.
+func (q *Queries) CVVersionOwnedByUser(ctx context.Context, arg CVVersionOwnedByUserParams) (bool, error) {
+	row := q.db.QueryRow(ctx, cVVersionOwnedByUser, arg.ID, arg.UserID)
+	var owned bool
+	err := row.Scan(&owned)
+	return owned, err
+}
+
 const createApplication = `-- name: CreateApplication :one
 
 INSERT INTO applications (
-    id, company_name, job_title, job_description, job_url,
+    id, user_id, company_name, job_title, job_description, job_url,
     site_id, cv_version_id, status, applied_at
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+WHERE EXISTS (
+    SELECT 1 FROM sites AS chk_site
+    WHERE chk_site.id = $7 AND (chk_site.user_id IS NULL OR chk_site.user_id = $2)
+)
+AND ($8::uuid IS NULL OR EXISTS (
+    SELECT 1 FROM cv_versions AS chk_cv
+    WHERE chk_cv.id = $8 AND chk_cv.user_id = $2
+))
 RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
 type CreateApplicationParams struct {
 	ID             uuid.UUID         `json:"id"`
+	UserID         uuid.UUID         `json:"user_id"`
 	CompanyName    string            `json:"company_name"`
 	JobTitle       string            `json:"job_title"`
 	JobDescription string            `json:"job_description"`
@@ -35,12 +67,24 @@ type CreateApplicationParams struct {
 	AppliedAt      *time.Time        `json:"applied_at"`
 }
 
-// Queries for the applications module. Run `sqlc generate` after adding this
-// file; internal/db/sqlc/applications.sql.go and the additions to querier.go are
-// generated from it.
+// Queries for the applications module.
+//
+// Phase 15: every statement is now scoped by user_id — either as a WHERE clause
+// on an existing row, or as a column on a new one. The one exception is
+// ResolveSiteByDomain, which matches a global (user_id IS NULL) site OR one the
+// caller owns, because a pre-configured site belongs to everyone.
+// Both WHERE EXISTS clauses are load-bearing, not decorative: site_id and
+// cv_version_id are foreign keys, and a foreign key only proves the row
+// exists — it says nothing about who owns it. site_id must be global
+// (user_id IS NULL) or the caller's own, matching every other site read in
+// this codebase. cv_version_id is nullable — no CV attached is always fine —
+// but when it is set, it must belong to this user; skip that check and one
+// user's application can end up pointing at another user's CV, which is a
+// worse leak than a rejected save.
 func (q *Queries) CreateApplication(ctx context.Context, arg CreateApplicationParams) (Application, error) {
 	row := q.db.QueryRow(ctx, createApplication,
 		arg.ID,
+		arg.UserID,
 		arg.CompanyName,
 		arg.JobTitle,
 		arg.JobDescription,
@@ -72,15 +116,16 @@ func (q *Queries) CreateApplication(ctx context.Context, arg CreateApplicationPa
 
 const createApplicationStatusHistory = `-- name: CreateApplicationStatusHistory :one
 INSERT INTO application_status_history (
-    application_id, from_status, to_status, changed_by, note
+    application_id, user_id, from_status, to_status, changed_by, note
 ) VALUES (
-    $1, $2, $3, $4, $5
+    $1, $2, $3, $4, $5, $6
 )
 RETURNING id, application_id, from_status, to_status, changed_by, note, changed_at, user_id
 `
 
 type CreateApplicationStatusHistoryParams struct {
 	ApplicationID uuid.UUID          `json:"application_id"`
+	UserID        uuid.UUID          `json:"user_id"`
 	FromStatus    *ApplicationStatus `json:"from_status"`
 	ToStatus      ApplicationStatus  `json:"to_status"`
 	ChangedBy     StatusChangeSource `json:"changed_by"`
@@ -90,6 +135,7 @@ type CreateApplicationStatusHistoryParams struct {
 func (q *Queries) CreateApplicationStatusHistory(ctx context.Context, arg CreateApplicationStatusHistoryParams) (ApplicationStatusHistory, error) {
 	row := q.db.QueryRow(ctx, createApplicationStatusHistory,
 		arg.ApplicationID,
+		arg.UserID,
 		arg.FromStatus,
 		arg.ToStatus,
 		arg.ChangedBy,
@@ -110,8 +156,8 @@ func (q *Queries) CreateApplicationStatusHistory(ctx context.Context, arg Create
 }
 
 const createPendingFollowUpReminder = `-- name: CreatePendingFollowUpReminder :one
-INSERT INTO follow_up_reminders (application_id, due_at)
-VALUES ($1, $2)
+INSERT INTO follow_up_reminders (application_id, user_id, due_at)
+VALUES ($1, $2, $3)
 ON CONFLICT (application_id) WHERE sent_at IS NULL AND dismissed_at IS NULL
 DO NOTHING
 RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated_at, user_id
@@ -119,13 +165,17 @@ RETURNING id, application_id, due_at, sent_at, dismissed_at, created_at, updated
 
 type CreatePendingFollowUpReminderParams struct {
 	ApplicationID uuid.UUID `json:"application_id"`
+	UserID        uuid.UUID `json:"user_id"`
 	DueAt         time.Time `json:"due_at"`
 }
 
 // uq_follow_up_reminders_one_pending allows a single un-sent, un-dismissed
-// reminder per application, so a re-save is a no-op rather than an error.
+// reminder per application, so a re-save is a no-op rather than an error. The
+// constraint stays scoped by application_id alone (000015's reasoning: an
+// application already belongs to exactly one user), so user_id here is a
+// column to fill in, not part of what makes a reminder unique.
 func (q *Queries) CreatePendingFollowUpReminder(ctx context.Context, arg CreatePendingFollowUpReminderParams) (FollowUpReminder, error) {
-	row := q.db.QueryRow(ctx, createPendingFollowUpReminder, arg.ApplicationID, arg.DueAt)
+	row := q.db.QueryRow(ctx, createPendingFollowUpReminder, arg.ApplicationID, arg.UserID, arg.DueAt)
 	var i FollowUpReminder
 	err := row.Scan(
 		&i.ID,
@@ -141,13 +191,18 @@ func (q *Queries) CreatePendingFollowUpReminder(ctx context.Context, arg CreateP
 }
 
 const deleteApplication = `-- name: DeleteApplication :execrows
-DELETE FROM applications WHERE id = $1
+DELETE FROM applications WHERE applications.id = $1 AND applications.user_id = $2
 `
+
+type DeleteApplicationParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
 
 // Cover letters, status history, reminders and recruiter contacts go with it via
 // ON DELETE CASCADE.
-func (q *Queries) DeleteApplication(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteApplication, id)
+func (q *Queries) DeleteApplication(ctx context.Context, arg DeleteApplicationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteApplication, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -158,27 +213,42 @@ const dismissPendingFollowUpReminders = `-- name: DismissPendingFollowUpReminder
 UPDATE follow_up_reminders
 SET dismissed_at = now()
 WHERE application_id = $1
+  AND user_id = $2
   AND sent_at IS NULL
   AND dismissed_at IS NULL
 `
 
+type DismissPendingFollowUpRemindersParams struct {
+	ApplicationID uuid.UUID `json:"application_id"`
+	UserID        uuid.UUID `json:"user_id"`
+}
+
 // Called when an application moves off Applied: the company (or the user) has
-// moved it on, so there is nothing left to chase.
-func (q *Queries) DismissPendingFollowUpReminders(ctx context.Context, applicationID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, dismissPendingFollowUpReminders, applicationID)
+// moved it on, so there is nothing left to chase. user_id is redundant with
+// application_id ownership already established by the caller, but it costs
+// nothing to assert here too.
+func (q *Queries) DismissPendingFollowUpReminders(ctx context.Context, arg DismissPendingFollowUpRemindersParams) error {
+	_, err := q.db.Exec(ctx, dismissPendingFollowUpReminders, arg.ApplicationID, arg.UserID)
 	return err
 }
 
 const findApplicationsByCompanyName = `-- name: FindApplicationsByCompanyName :many
 SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications
-WHERE lower(btrim(company_name)) = lower(btrim($1::text))
+WHERE user_id = $1
+  AND lower(btrim(company_name)) = lower(btrim($2::text))
 ORDER BY COALESCE(applied_at, created_at) DESC
 `
 
+type FindApplicationsByCompanyNameParams struct {
+	UserID      uuid.UUID `json:"user_id"`
+	CompanyName string    `json:"company_name"`
+}
+
 // The MVP duplicate check: exact company name, ignoring case and surrounding
-// whitespace. Embedding similarity is a later phase.
-func (q *Queries) FindApplicationsByCompanyName(ctx context.Context, companyName string) ([]Application, error) {
-	rows, err := q.db.Query(ctx, findApplicationsByCompanyName, companyName)
+// whitespace, scoped to the caller — someone else applying to the same company
+// is not this user's duplicate.
+func (q *Queries) FindApplicationsByCompanyName(ctx context.Context, arg FindApplicationsByCompanyNameParams) ([]Application, error) {
+	rows, err := q.db.Query(ctx, findApplicationsByCompanyName, arg.UserID, arg.CompanyName)
 	if err != nil {
 		return nil, err
 	}
@@ -212,12 +282,50 @@ func (q *Queries) FindApplicationsByCompanyName(ctx context.Context, companyName
 	return items, nil
 }
 
-const getApplication = `-- name: GetApplication :one
-SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications WHERE id = $1
+const findSiteByID = `-- name: FindSiteByID :one
+SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
+WHERE id = $1 AND (user_id IS NULL OR user_id = $2::uuid)
 `
 
-func (q *Queries) GetApplication(ctx context.Context, id uuid.UUID) (Application, error) {
-	row := q.db.QueryRow(ctx, getApplication, id)
+type FindSiteByIDParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Validates a client-supplied site_id before it is trusted: global (user_id IS
+// NULL) or the caller's own. Without this, resolveSiteID would accept any
+// site_id the caller sent — including one belonging to somebody else — since
+// the column only exists to be trusted, not verified, once it reaches the
+// insert. Mirrors ResolveSiteByDomain's same-scope reasoning, keyed by id
+// instead of domain.
+func (q *Queries) FindSiteByID(ctx context.Context, arg FindSiteByIDParams) (Site, error) {
+	row := q.db.QueryRow(ctx, findSiteByID, arg.ID, arg.UserID)
+	var i Site
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Domain,
+		&i.IsPreconfigured,
+		&i.IsActive,
+		&i.Selectors,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UserID,
+	)
+	return i, err
+}
+
+const getApplication = `-- name: GetApplication :one
+SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications WHERE applications.id = $1 AND applications.user_id = $2
+`
+
+type GetApplicationParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) GetApplication(ctx context.Context, arg GetApplicationParams) (Application, error) {
+	row := q.db.QueryRow(ctx, getApplication, arg.ID, arg.UserID)
 	var i Application
 	err := row.Scan(
 		&i.ID,
@@ -240,12 +348,17 @@ func (q *Queries) GetApplication(ctx context.Context, id uuid.UUID) (Application
 
 const listApplicationStatusHistory = `-- name: ListApplicationStatusHistory :many
 SELECT id, application_id, from_status, to_status, changed_by, note, changed_at, user_id FROM application_status_history
-WHERE application_id = $1
+WHERE application_id = $1 AND user_id = $2
 ORDER BY changed_at ASC
 `
 
-func (q *Queries) ListApplicationStatusHistory(ctx context.Context, applicationID uuid.UUID) ([]ApplicationStatusHistory, error) {
-	rows, err := q.db.Query(ctx, listApplicationStatusHistory, applicationID)
+type ListApplicationStatusHistoryParams struct {
+	ApplicationID uuid.UUID `json:"application_id"`
+	UserID        uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) ListApplicationStatusHistory(ctx context.Context, arg ListApplicationStatusHistoryParams) ([]ApplicationStatusHistory, error) {
+	rows, err := q.db.Query(ctx, listApplicationStatusHistory, arg.ApplicationID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -275,23 +388,25 @@ func (q *Queries) ListApplicationStatusHistory(ctx context.Context, applicationI
 
 const listApplications = `-- name: ListApplications :many
 SELECT id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id FROM applications
-WHERE ($1::application_status IS NULL OR status = $1::application_status)
-  AND ($2::uuid IS NULL OR site_id = $2::uuid)
-  AND ($3::uuid IS NULL OR cv_version_id = $3::uuid)
-  AND ($4::text IS NULL
-       OR company_name ILIKE '%' || $4::text || '%')
+WHERE user_id = $1
+  AND ($2::application_status IS NULL OR status = $2::application_status)
+  AND ($3::uuid IS NULL OR site_id = $3::uuid)
+  AND ($4::uuid IS NULL OR cv_version_id = $4::uuid)
   AND ($5::text IS NULL
-       OR company_name ILIKE '%' || $5::text || '%'
-       OR job_title ILIKE '%' || $5::text || '%')
-  AND ($6::timestamptz IS NULL
-       OR COALESCE(applied_at, created_at) >= $6::timestamptz)
+       OR company_name ILIKE '%' || $5::text || '%')
+  AND ($6::text IS NULL
+       OR company_name ILIKE '%' || $6::text || '%'
+       OR job_title ILIKE '%' || $6::text || '%')
   AND ($7::timestamptz IS NULL
-       OR COALESCE(applied_at, created_at) <= $7::timestamptz)
+       OR COALESCE(applied_at, created_at) >= $7::timestamptz)
+  AND ($8::timestamptz IS NULL
+       OR COALESCE(applied_at, created_at) <= $8::timestamptz)
 ORDER BY COALESCE(applied_at, created_at) DESC, created_at DESC
-LIMIT $9::int OFFSET $8::int
+LIMIT $10::int OFFSET $9::int
 `
 
 type ListApplicationsParams struct {
+	UserID      uuid.UUID          `json:"user_id"`
 	Status      *ApplicationStatus `json:"status"`
 	SiteID      *uuid.UUID         `json:"site_id"`
 	CvVersionID *uuid.UUID         `json:"cv_version_id"`
@@ -308,6 +423,7 @@ type ListApplicationsParams struct {
 // otherwise — so a Saved application is never invisible to a date range.
 func (q *Queries) ListApplications(ctx context.Context, arg ListApplicationsParams) ([]Application, error) {
 	rows, err := q.db.Query(ctx, listApplications,
+		arg.UserID,
 		arg.Status,
 		arg.SiteID,
 		arg.CvVersionID,
@@ -355,18 +471,26 @@ const resolveSiteByDomain = `-- name: ResolveSiteByDomain :one
 SELECT id, name, domain, is_preconfigured, is_active, selectors, created_at, updated_at, user_id FROM sites
 WHERE is_active = true
   AND regexp_replace(lower(btrim(domain)), '^www\.', '') = $1::text
+  AND (user_id IS NULL OR user_id = $2::uuid)
 LIMIT 1
 `
 
+type ResolveSiteByDomainParams struct {
+	Domain string    `json:"domain"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
 // Turns a job URL host into a site_id when the client did not send one.
-// NOTE: if queries/sites.sql already defines an equivalent lookup, delete this
-// one and point the repository at that generated method instead — two queries
-// with the same name in the same package will not compile.
+//
+// Matches a global site (user_id IS NULL — the pre-configured list every user
+// sees) or one the caller registered themselves. Without the second half of
+// that OR, a user's own custom site could never be resolved from a job URL,
+// only from an explicit site_id.
 //
 // The service passes a lowercased, www-stripped host, so the stored value is
 // normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
-func (q *Queries) ResolveSiteByDomain(ctx context.Context, domain string) (Site, error) {
-	row := q.db.QueryRow(ctx, resolveSiteByDomain, domain)
+func (q *Queries) ResolveSiteByDomain(ctx context.Context, arg ResolveSiteByDomainParams) (Site, error) {
+	row := q.db.QueryRow(ctx, resolveSiteByDomain, arg.Domain, arg.UserID)
 	var i Site
 	err := row.Scan(
 		&i.ID,
@@ -383,12 +507,11 @@ func (q *Queries) ResolveSiteByDomain(ctx context.Context, domain string) (Site,
 }
 
 const setApplicationAIScore = `-- name: SetApplicationAIScore :one
-
 UPDATE applications
 SET ai_score             = $1,
     ai_score_explanation = $2,
     updated_at           = now()
-WHERE id = $3
+WHERE applications.id = $3 AND applications.user_id = $4
 RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
@@ -396,24 +519,19 @@ type SetApplicationAIScoreParams struct {
 	AiScore            *float64  `json:"ai_score"`
 	AiScoreExplanation *string   `json:"ai_score_explanation"`
 	ID                 uuid.UUID `json:"id"`
+	UserID             uuid.UUID `json:"user_id"`
 }
 
-// ---------------------------------------------------------------------------
-// PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
-//
-// This file is not a queries file of its own -- it exists only because
-// queries/applications.sql was not part of the phase upload. Delete it once the
-// query has been moved across.
-//
-// If applications.sql keeps updated_at current with a trigger rather than in
-// each statement, drop the `updated_at = now()` line to match the other writes
-// in that file.
-// ---------------------------------------------------------------------------
 // Writes the GPT-4o-mini job-match score. Called inside the same transaction as
 // CreateApplication (Flow 1 step 23), and available on its own as the retry path
 // for an application saved while scoring was unavailable.
 func (q *Queries) SetApplicationAIScore(ctx context.Context, arg SetApplicationAIScoreParams) (Application, error) {
-	row := q.db.QueryRow(ctx, setApplicationAIScore, arg.AiScore, arg.AiScoreExplanation, arg.ID)
+	row := q.db.QueryRow(ctx, setApplicationAIScore,
+		arg.AiScore,
+		arg.AiScoreExplanation,
+		arg.ID,
+		arg.UserID,
+	)
 	var i Application
 	err := row.Scan(
 		&i.ID,
@@ -442,7 +560,16 @@ SET company_name    = $2,
     job_url         = $5,
     site_id         = $6,
     cv_version_id   = $7
-WHERE id = $1
+WHERE applications.id = $1
+  AND applications.user_id = $8
+  AND EXISTS (
+      SELECT 1 FROM sites AS chk_site
+      WHERE chk_site.id = $6 AND (chk_site.user_id IS NULL OR chk_site.user_id = $8)
+  )
+  AND ($7::uuid IS NULL OR EXISTS (
+      SELECT 1 FROM cv_versions AS chk_cv
+      WHERE chk_cv.id = $7 AND chk_cv.user_id = $8
+  ))
 RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
@@ -454,10 +581,15 @@ type UpdateApplicationParams struct {
 	JobUrl         string     `json:"job_url"`
 	SiteID         uuid.UUID  `json:"site_id"`
 	CvVersionID    *uuid.UUID `json:"cv_version_id"`
+	UserID         uuid.UUID  `json:"user_id"`
 }
 
 // Captured job data only. Status never moves here — that is
 // UpdateApplicationStatus, so no transition can skip the audit trail.
+//
+// Same ownership guards as CreateApplication, for the same reason: this is
+// also the query Complete uses to attach a CV version (Flow 2), so the check
+// has to live here too, not only on the insert path.
 func (q *Queries) UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (Application, error) {
 	row := q.db.QueryRow(ctx, updateApplication,
 		arg.ID,
@@ -467,6 +599,7 @@ func (q *Queries) UpdateApplication(ctx context.Context, arg UpdateApplicationPa
 		arg.JobUrl,
 		arg.SiteID,
 		arg.CvVersionID,
+		arg.UserID,
 	)
 	var i Application
 	err := row.Scan(
@@ -492,7 +625,7 @@ const updateApplicationStatus = `-- name: UpdateApplicationStatus :one
 UPDATE applications
 SET status     = $1,
     applied_at = COALESCE(applications.applied_at, $2::timestamptz)
-WHERE id = $3
+WHERE applications.id = $3 AND applications.user_id = $4
 RETURNING id, company_name, job_title, job_description, job_url, site_id, cv_version_id, status, ai_score, ai_score_explanation, applied_at, created_at, updated_at, user_id
 `
 
@@ -500,13 +633,19 @@ type UpdateApplicationStatusParams struct {
 	Status    ApplicationStatus `json:"status"`
 	AppliedAt *time.Time        `json:"applied_at"`
 	ID        uuid.UUID         `json:"id"`
+	UserID    uuid.UUID         `json:"user_id"`
 }
 
 // applied_at is write-once: COALESCE keeps the original timestamp if the
 // application has already been applied to, so bouncing through statuses later
 // never rewrites when it was actually sent.
 func (q *Queries) UpdateApplicationStatus(ctx context.Context, arg UpdateApplicationStatusParams) (Application, error) {
-	row := q.db.QueryRow(ctx, updateApplicationStatus, arg.Status, arg.AppliedAt, arg.ID)
+	row := q.db.QueryRow(ctx, updateApplicationStatus,
+		arg.Status,
+		arg.AppliedAt,
+		arg.ID,
+		arg.UserID,
+	)
 	var i Application
 	err := row.Scan(
 		&i.ID,

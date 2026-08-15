@@ -16,18 +16,23 @@ const createCoverLetter = `-- name: CreateCoverLetter :one
 INSERT INTO cover_letters (
     id,
     application_id,
+    user_id,
     kind,
     body_text,
     s3_key,
     original_filename
 )
-VALUES ($1, $2, $3, $4, $5, $6)
+SELECT $1, $2, $3, $4, $5, $6, $7
+WHERE EXISTS (
+    SELECT 1 FROM applications a WHERE a.id = $2 AND a.user_id = $3
+)
 RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 `
 
 type CreateCoverLetterParams struct {
 	ID               uuid.UUID       `json:"id"`
 	ApplicationID    uuid.UUID       `json:"application_id"`
+	UserID           uuid.UUID       `json:"user_id"`
 	Kind             CoverLetterKind `json:"kind"`
 	BodyText         *string         `json:"body_text"`
 	S3Key            *string         `json:"s3_key"`
@@ -39,12 +44,28 @@ type CreateCoverLetterParams struct {
 // cover_letters is one-to-one with applications (unique(application_id)), so
 // every statement here is keyed by application_id rather than by the row's own
 // id. There is no history table and nothing to match against.
+//
+// Phase 15: every statement adds user_id. This module's routes are mounted
+// independently of applications' own — nothing upstream of these queries
+// confirms the caller owns the application_id in the path — so without this
+// scope, one user could read, edit or overwrite another user's cover letter
+// simply by guessing or observing an application id.
 // The id is supplied by the service rather than defaulted, because a file
 // cover letter's S3 key is derived from it before the row is written.
+//
+// The WHERE EXISTS guard is load-bearing, not decorative: cover_letters'
+// foreign key on application_id only proves that application exists, not that
+// it belongs to this user. Without this guard, one user's application_id — a
+// UUID they could observe or guess — would let another user attach a cover
+// letter to it, because the FK alone has nothing to say about ownership. A
+// mismatch here reads as "no such application" to the caller, exactly like a
+// genuinely missing one, so an unauthorized caller learns nothing about
+// whether the id is real.
 func (q *Queries) CreateCoverLetter(ctx context.Context, arg CreateCoverLetterParams) (CoverLetter, error) {
 	row := q.db.QueryRow(ctx, createCoverLetter,
 		arg.ID,
 		arg.ApplicationID,
+		arg.UserID,
 		arg.Kind,
 		arg.BodyText,
 		arg.S3Key,
@@ -68,24 +89,34 @@ func (q *Queries) CreateCoverLetter(ctx context.Context, arg CreateCoverLetterPa
 const deleteCoverLetterByApplicationID = `-- name: DeleteCoverLetterByApplicationID :exec
 DELETE
 FROM cover_letters
-WHERE application_id = $1
+WHERE application_id = $1 AND user_id = $2
 `
+
+type DeleteCoverLetterByApplicationIDParams struct {
+	ApplicationID uuid.UUID `json:"application_id"`
+	UserID        uuid.UUID `json:"user_id"`
+}
 
 // Used to implement replace-on-save. Deleting a row that is not there is a
 // no-op, which is what the service relies on.
-func (q *Queries) DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteCoverLetterByApplicationID, applicationID)
+func (q *Queries) DeleteCoverLetterByApplicationID(ctx context.Context, arg DeleteCoverLetterByApplicationIDParams) error {
+	_, err := q.db.Exec(ctx, deleteCoverLetterByApplicationID, arg.ApplicationID, arg.UserID)
 	return err
 }
 
 const getCoverLetterByApplicationID = `-- name: GetCoverLetterByApplicationID :one
 SELECT id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 FROM cover_letters
-WHERE application_id = $1
+WHERE application_id = $1 AND user_id = $2
 `
 
-func (q *Queries) GetCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) (CoverLetter, error) {
-	row := q.db.QueryRow(ctx, getCoverLetterByApplicationID, applicationID)
+type GetCoverLetterByApplicationIDParams struct {
+	ApplicationID uuid.UUID `json:"application_id"`
+	UserID        uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) GetCoverLetterByApplicationID(ctx context.Context, arg GetCoverLetterByApplicationIDParams) (CoverLetter, error) {
+	row := q.db.QueryRow(ctx, getCoverLetterByApplicationID, arg.ApplicationID, arg.UserID)
 	var i CoverLetter
 	err := row.Scan(
 		&i.ID,
@@ -106,6 +137,7 @@ UPDATE cover_letters
 SET body_text  = $2,
     updated_at = now()
 WHERE application_id = $1
+  AND user_id = $3
   AND kind = 'text'
 RETURNING id, application_id, kind, body_text, s3_key, original_filename, created_at, updated_at, user_id
 `
@@ -113,13 +145,14 @@ RETURNING id, application_id, kind, body_text, s3_key, original_filename, create
 type UpdateCoverLetterTextParams struct {
 	ApplicationID uuid.UUID `json:"application_id"`
 	BodyText      *string   `json:"body_text"`
+	UserID        uuid.UUID `json:"user_id"`
 }
 
 // Scoped to kind = 'text'. A file cover letter records the bytes that were
 // actually sent and is immutable; without this predicate the row-level check
 // constraint would reject the write anyway, but with a far less useful error.
 func (q *Queries) UpdateCoverLetterText(ctx context.Context, arg UpdateCoverLetterTextParams) (CoverLetter, error) {
-	row := q.db.QueryRow(ctx, updateCoverLetterText, arg.ApplicationID, arg.BodyText)
+	row := q.db.QueryRow(ctx, updateCoverLetterText, arg.ApplicationID, arg.BodyText, arg.UserID)
 	var i CoverLetter
 	err := row.Scan(
 		&i.ID,

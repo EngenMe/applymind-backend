@@ -1,24 +1,17 @@
 // Package middleware holds Chi middleware shared across the API Lambda.
 //
-// Two authentication middlewares live here, and only one of them is meant to
-// survive:
+// RequireAuth resolves a real user from a session cookie (dashboard) or a
+// bearer API token (extension, and the dashboard's server-side demo route).
+// Every protected route sits behind it.
 //
-//   - RequireAuth resolves a real user from a session cookie (dashboard) or a
-//     bearer API token (extension, and the dashboard's server-side demo route).
-//     Everything written from phase 14 onwards sits behind this.
-//
-//   - LegacyStaticKeyAuth is the MVP's single shared key. It is kept alive for
-//     exactly one phase, because the modules behind it still ignore user_id:
-//     moving them onto RequireAuth now would authenticate a user and then hand
-//     them everybody's rows, which is worse than the shared key. Phase 15
-//     deletes it in the same change that makes those queries user-aware, and
-//     the name is deliberately awkward so that every call site reads as
-//     temporary until then.
+// Phase 15 removed the legacy shared-static-key middleware that used to sit
+// alongside this one: it authenticated nobody as a specific user, and every
+// module now requires a real user_id to scope its queries by, so it had
+// nothing left to guard.
 package middleware
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -31,55 +24,6 @@ import (
 )
 
 const bearerPrefix = "Bearer "
-
-// ---------------------------------------------------------------------------
-// Legacy: single static API key
-// ---------------------------------------------------------------------------
-
-// LegacyStaticKeyAuth returns Chi-compatible middleware that requires an exact
-// "Authorization: Bearer <key>" header matching expectedKey. Comparison uses
-// subtle.ConstantTimeCompare so response latency cannot be used to guess the
-// key one byte at a time.
-//
-// expectedKey must be non-empty; an empty key would make every request with
-// a missing header pass (empty == empty), which is never correct.
-//
-// This was APIKeyAuth. It identifies nobody, cannot be revoked, and is shared
-// by every caller. Phase 15 removes it along with the last route that uses it;
-// nothing new should be put behind it.
-func LegacyStaticKeyAuth(expectedKey string) func(http.Handler) http.Handler {
-	if expectedKey == "" {
-		panic("middleware: LegacyStaticKeyAuth requires a non-empty expectedKey")
-	}
-
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(
-			func(w http.ResponseWriter, r *http.Request) {
-				header := r.Header.Get("Authorization")
-
-				if !strings.HasPrefix(header, bearerPrefix) {
-					unauthorized(w)
-					return
-				}
-
-				presented := strings.TrimPrefix(header, bearerPrefix)
-
-				// ConstantTimeCompare requires equal-length inputs to give its
-				// timing guarantee; unequal lengths already fail comparison
-				// safely, but we still route both cases through it rather than
-				// branching on length first, to avoid a length-based timing
-				// side channel of our own making.
-				match := subtle.ConstantTimeCompare([]byte(presented), []byte(expectedKey)) == 1
-				if !match {
-					unauthorized(w)
-					return
-				}
-
-				next.ServeHTTP(w, r)
-			},
-		)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Request context
@@ -122,6 +66,25 @@ func UserIDFromRequest(r *http.Request) (uuid.UUID, bool) {
 	return UserID(r.Context())
 }
 
+// TestContextWithUserID returns a context carrying userID as if RequireAuth
+// had already resolved it.
+//
+// It exists because identityContextKey is deliberately unexported — nothing
+// outside this package can forge an identity — which also means no other
+// package's handler tests can populate the context RequireAuth would have set
+// without going through it. This is that door, held open for exactly that
+// purpose: every module's handler_test.go builds its router directly against
+// NewHandler and sends requests with no RequireAuth in front of them, so
+// without this, requireUser would find nothing and every test would 500.
+//
+// Production code must never call this — there is nothing stopping it at the
+// type level, the same way nothing stops production code from constructing
+// its own *auth.Identity, but doing so would be forging a credential rather
+// than checking one.
+func TestContextWithUserID(ctx context.Context, userID uuid.UUID) context.Context {
+	return context.WithValue(ctx, identityContextKey{}, &auth.Identity{UserID: userID})
+}
+
 // ---------------------------------------------------------------------------
 // Real authentication
 // ---------------------------------------------------------------------------
@@ -143,9 +106,7 @@ var errNoCredential = errors.New("middleware: no credential presented")
 // oversight. Nothing in this path compares a presented secret against a stored
 // one in Go: the raw credential is SHA-256'd and the digest is used as a lookup
 // key, so the only equality test is the database's, against 256 bits of
-// crypto/rand entropy. A timing signal on that leaks nothing guessable. The
-// discipline still applies in LegacyStaticKeyAuth above, which does hold a
-// secret in memory and does compare it.
+// crypto/rand entropy. A timing signal on that leaks nothing guessable.
 func RequireAuth(svc auth.Service, logger *slog.Logger) func(http.Handler) http.Handler {
 	if svc == nil {
 		panic("middleware: RequireAuth requires an auth.Service")
@@ -260,12 +221,40 @@ func isSafeMethod(method string) bool {
 // exactly what an unauthenticated or fully-authenticated caller hitting the
 // same unsupported method already gets. Only a request that resolves to a
 // genuine read-only credential changes behaviour here.
+//
+// Only the bearer path is resolved, and only when the method is already an
+// unsafe one. A session is never read-only — AuthenticateSession hard-codes
+// that — so running the cookie path here could not change the answer, while it
+// would cost a session lookup, a user lookup and possibly a sliding-expiry
+// write on a request that is about to 404-adjacent 405 anyway. Restricting it
+// to the bearer path also keeps this to the single token lookup the comment at
+// the call site promises.
 func CheckReadOnlyWrite(r *http.Request, svc auth.Service) bool {
-	identity, err := resolveIdentity(r, svc)
+	if isSafeMethod(r.Method) {
+		return false
+	}
+	// A cookie means a session, and a session may always write. Checked before
+	// the header so a dashboard request carrying both is not resolved as its
+	// bearer token here when RequireAuth would have resolved it as its cookie —
+	// the two must not disagree about who the caller is.
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil && cookie.Value != "" {
+		return false
+	}
+
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, bearerPrefix) {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, bearerPrefix))
+	if token == "" {
+		return false
+	}
+
+	identity, err := svc.AuthenticateAPIToken(r.Context(), token)
 	if err != nil {
 		return false
 	}
-	return identity.IsReadOnly && !isSafeMethod(r.Method)
+	return identity.IsReadOnly
 }
 
 // rejectionReason is for the log only. Expired and revoked are deliberately not

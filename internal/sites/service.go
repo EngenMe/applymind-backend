@@ -11,22 +11,28 @@ import (
 )
 
 // Service is the business logic boundary for the sites module.
+//
+// Phase 15: every method but SeedPreconfigured takes the caller's userID.
+// SeedPreconfigured is the exception because it runs once at boot, before any
+// request exists, and only ever writes global rows.
 type Service interface {
 	// SeedPreconfigured inserts every pre-configured site that is not in the
 	// table yet and returns how many rows it created. It is idempotent, so it is
 	// safe to call on every boot; migration 000010 already seeds LinkedIn as the
 	// guard for applications.site_id being NOT NULL, and that row is left alone.
 	SeedPreconfigured(ctx context.Context) (int, error)
-	List(ctx context.Context, f ListFilter) ([]Site, error)
-	Get(ctx context.Context, id uuid.UUID) (*Site, error)
+	List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Site, error)
+	Get(ctx context.Context, userID, id uuid.UUID) (*Site, error)
 	// Add registers a user's own site. The domain is normalised to a bare host
 	// before it is stored, so it matches what a job URL resolves to later.
-	Add(ctx context.Context, in AddInput) (*Site, error)
+	Add(ctx context.Context, userID uuid.UUID, in AddInput) (*Site, error)
 	// ToggleActive flips is_active. Allowed on pre-configured sites: the ERD
-	// permits deactivating them, only not deleting them.
-	ToggleActive(ctx context.Context, id uuid.UUID) (*Site, error)
+	// permits deactivating them, only not deleting them. A pre-configured row
+	// is global, so this is one shared switch — see SetSiteActive in
+	// queries/sites.sql for the reasoning.
+	ToggleActive(ctx context.Context, userID, id uuid.UUID) (*Site, error)
 	// Delete removes a custom site. Pre-configured sites are refused.
-	Delete(ctx context.Context, id uuid.UUID) error
+	Delete(ctx context.Context, userID, id uuid.UUID) error
 }
 
 type service struct {
@@ -63,15 +69,15 @@ func (s *service) SeedPreconfigured(ctx context.Context) (int, error) {
 	return created, nil
 }
 
-func (s *service) List(ctx context.Context, f ListFilter) ([]Site, error) {
-	return s.repo.List(ctx, f)
+func (s *service) List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Site, error) {
+	return s.repo.List(ctx, userID, f)
 }
 
-func (s *service) Get(ctx context.Context, id uuid.UUID) (*Site, error) {
-	return s.repo.Get(ctx, id)
+func (s *service) Get(ctx context.Context, userID, id uuid.UUID) (*Site, error) {
+	return s.repo.Get(ctx, userID, id)
 }
 
-func (s *service) Add(ctx context.Context, in AddInput) (*Site, error) {
+func (s *service) Add(ctx context.Context, userID uuid.UUID, in AddInput) (*Site, error) {
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return nil, ErrNameRequired
@@ -86,8 +92,10 @@ func (s *service) Add(ctx context.Context, in AddInput) (*Site, error) {
 
 	// A friendly error ahead of the unique constraint. The constraint is still
 	// the authority — translateWriteError catches the race — but this way the
-	// common case reports the domain rather than a generic collision.
-	existing, err := s.repo.GetByDomain(ctx, domain)
+	// common case reports the domain rather than a generic collision. Scoped to
+	// this user: someone else's custom site with the same domain, or the global
+	// pre-configured list, both still legitimately collide here.
+	existing, err := s.repo.GetByDomain(ctx, userID, domain)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
@@ -97,6 +105,7 @@ func (s *service) Add(ctx context.Context, in AddInput) (*Site, error) {
 
 	return s.repo.Create(
 		ctx, NewSite{
+			UserID:          &userID,
 			Name:            name,
 			Domain:          domain,
 			IsPreconfigured: false,
@@ -105,19 +114,19 @@ func (s *service) Add(ctx context.Context, in AddInput) (*Site, error) {
 	)
 }
 
-func (s *service) ToggleActive(ctx context.Context, id uuid.UUID) (*Site, error) {
+func (s *service) ToggleActive(ctx context.Context, userID, id uuid.UUID) (*Site, error) {
 	// Read first so a missing id is a 404 rather than a silent no-op, and so the
 	// endpoint can stay body-less: the caller does not have to know the current
 	// value to flip it.
-	current, err := s.repo.Get(ctx, id)
+	current, err := s.repo.Get(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
-	return s.repo.SetActive(ctx, id, !current.IsActive)
+	return s.repo.SetActive(ctx, userID, id, !current.IsActive)
 }
 
-func (s *service) Delete(ctx context.Context, id uuid.UUID) error {
-	site, err := s.repo.Get(ctx, id)
+func (s *service) Delete(ctx context.Context, userID, id uuid.UUID) error {
+	site, err := s.repo.Get(ctx, userID, id)
 	if err != nil {
 		return err
 	}
@@ -126,7 +135,7 @@ func (s *service) Delete(ctx context.Context, id uuid.UUID) error {
 	}
 	// Still ErrInUse from here when applications reference the site: the
 	// ON DELETE RESTRICT foreign key is the real guard, not this check.
-	return s.repo.Delete(ctx, id)
+	return s.repo.Delete(ctx, userID, id)
 }
 
 // ---------------------------------------------------------------------------

@@ -71,9 +71,15 @@ type SaveFileInput struct {
 
 // NewCoverLetter is the repository-level input for inserting a row. Exactly one
 // of the two field groups is populated, matching the table's check constraint.
+//
+// UserID is set by the service from the authenticated caller, never from the
+// application_id alone — this module's routes have no dependency on the
+// applications module confirming ownership first, so the write itself has to
+// carry it.
 type NewCoverLetter struct {
 	ID               uuid.UUID
 	ApplicationID    uuid.UUID
+	UserID           uuid.UUID
 	Kind             Kind
 	BodyText         *string
 	S3Key            *string

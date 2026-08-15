@@ -8,13 +8,15 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
 // Handler exposes the notifications module over HTTP via chi, matching the
-// router set up in cmd/api/main.go. Register it inside the API-key-protected
+// router set up in cmd/api/main.go. Register it inside the authenticated
 // group:
 //
-//	notifications.NewHandler(notifSvc, logger).RegisterRoutes(protected)
+//	notifications.NewHandler(notifSvc, logger).RegisterRoutes(authed)
 type Handler struct {
 	svc    Service
 	logger *slog.Logger
@@ -29,6 +31,21 @@ func NewHandler(svc Service, logger *slog.Logger) *Handler {
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/notifications/due", h.ListDue)
+}
+
+// requireUser reads the authenticated caller. See the identical helper in
+// internal/auth and internal/cvs for why a missing user here is a 500, not a 401.
+func (h *Handler) requireUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		h.logger.ErrorContext(
+			r.Context(), "notifications: no user in context on a protected route",
+			slog.String("path", r.URL.Path),
+		)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "something went wrong")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 // ---------------------------------------------------------------------------
@@ -63,16 +80,21 @@ type actionResponse struct {
 
 // ListDue — GET /notifications/due
 //
-// What the dashboard should be showing right now. Reminders the daily sweep has
-// already dispatched are included, flagged with already_notified, because a
-// reminder raised at 08:00 is still the answer when the tab is opened at noon.
-// A reminder leaves this list when its application stops being Applied, which
-// dismisses it.
+// What this user's dashboard should be showing right now. Reminders the daily
+// sweep has already dispatched are included, flagged with already_notified,
+// because a reminder raised at 08:00 is still the answer when the tab is
+// opened at noon. A reminder leaves this list when its application stops being
+// Applied, which dismisses it.
 //
 // The browser notification itself is raised by the client from this payload —
 // nothing here pushes.
 func (h *Handler) ListDue(w http.ResponseWriter, r *http.Request) {
-	notifications, err := h.svc.ListDue(r.Context())
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	notifications, err := h.svc.ListDue(r.Context(), userID)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -137,8 +159,8 @@ type errorBody struct {
 }
 
 // writeServiceError has only a default arm for now: the one endpoint takes no
-// input, so nothing it can be handed is invalid. Domain errors get their own
-// cases as endpoints are added.
+// input beyond the authenticated user, so nothing it can be handed is invalid.
+// Domain errors get their own cases as endpoints are added.
 func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	h.logger.ErrorContext(
 		r.Context(), "notifications handler failure",

@@ -31,12 +31,14 @@ FROM follow_up_reminders r
 WHERE r.dismissed_at IS NULL
   AND r.due_at <= $1::timestamptz
   AND ($2::boolean OR r.sent_at IS NULL)
+  AND ($3::uuid IS NULL OR r.user_id = $3::uuid)
 ORDER BY r.due_at ASC
 `
 
 type FindDueFollowUpRemindersParams struct {
-	AsOf        time.Time `json:"as_of"`
-	IncludeSent bool      `json:"include_sent"`
+	AsOf        time.Time  `json:"as_of"`
+	IncludeSent bool       `json:"include_sent"`
+	UserID      *uuid.UUID `json:"user_id"`
 }
 
 type FindDueFollowUpRemindersRow struct {
@@ -64,8 +66,15 @@ type FindDueFollowUpRemindersRow struct {
 // (flow 4's sent_at IS NULL, which makes a second run on the same day a no-op);
 // true is the dashboard poll, which still wants a reminder the sweep already
 // dispatched this morning.
+//
+// Phase 15: @user_id is nullable, on purpose. The scheduler has no request, no
+// caller, no single user to scope to — its sweep runs for everyone in one pass,
+// so it passes NULL and every user's due reminders come back together. The
+// dashboard's GET /notifications/due has a real caller and passes their id, so
+// it only ever sees its own. Both are "the same query", just with the filter
+// turned off for the one caller that legitimately has no single user in mind.
 func (q *Queries) FindDueFollowUpReminders(ctx context.Context, arg FindDueFollowUpRemindersParams) ([]FindDueFollowUpRemindersRow, error) {
-	rows, err := q.db.Query(ctx, findDueFollowUpReminders, arg.AsOf, arg.IncludeSent)
+	rows, err := q.db.Query(ctx, findDueFollowUpReminders, arg.AsOf, arg.IncludeSent, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +126,10 @@ type MarkFollowUpReminderSentParams struct {
 //
 // The sent_at IS NULL guard makes this idempotent — a concurrent or repeated
 // run updates nothing and returns no row rather than moving the timestamp.
+//
+// Unscoped by user on purpose: the sweep already resolved which reminder to
+// mark via FindDueFollowUpReminders (NULL user_id, everyone's), and by the
+// time this runs the reminder id is trusted, not caller-supplied.
 func (q *Queries) MarkFollowUpReminderSent(ctx context.Context, arg MarkFollowUpReminderSentParams) (FollowUpReminder, error) {
 	row := q.db.QueryRow(ctx, markFollowUpReminderSent, arg.SentAt, arg.ID)
 	var i FollowUpReminder

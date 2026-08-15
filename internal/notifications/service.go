@@ -5,20 +5,29 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Service is the business logic boundary for the notifications module. Both
 // Lambdas call it: the scheduler runs CheckReminders once per EventBridge
 // invocation, and the API can run it on demand or serve ListDue to the
 // dashboard.
+//
+// Phase 15: CheckReminders is deliberately the one method in this codebase
+// with no userID parameter. The scheduler has no request and no single caller
+// — its sweep is for everyone in one pass, same as before multi-tenancy — so it
+// passes nil down to Repository.FindDue itself. ListDue has a real caller and
+// takes their userID, so the dashboard only ever sees its own reminders.
 type Service interface {
-	// CheckReminders performs one sweep — flow 4 phases 2 to 4. It finds the
-	// reminders that have come due, dispatches a notification for each and marks
-	// each one sent. A failure on one reminder does not stop the rest.
+	// CheckReminders performs one sweep — flow 4 phases 2 to 4 — across every
+	// user's reminders. It finds the reminders that have come due, dispatches a
+	// notification for each and marks each one sent. A failure on one reminder
+	// does not stop the rest.
 	CheckReminders(ctx context.Context) (*RunSummary, error)
-	// ListDue returns what the dashboard should surface right now, including
-	// reminders the sweep has already dispatched today.
-	ListDue(ctx context.Context) ([]Notification, error)
+	// ListDue returns what this user's dashboard should surface right now,
+	// including reminders the sweep has already dispatched today.
+	ListDue(ctx context.Context, userID uuid.UUID) ([]Notification, error)
 }
 
 // Notifier is the delivery port.
@@ -87,7 +96,7 @@ func NewService(repo Repository, opts ...ServiceOption) Service {
 	return s
 }
 
-// CheckReminders implements flow 4 phases 2 to 4.
+// CheckReminders implements flow 4 phases 2 to 4, for every user in one pass.
 //
 // Only a failure to read the due list aborts the run: at that point there is
 // nothing to iterate. Everything inside the loop is per-reminder, so one bad
@@ -95,7 +104,10 @@ func NewService(repo Repository, opts ...ServiceOption) Service {
 func (s *service) CheckReminders(ctx context.Context) (*RunSummary, error) {
 	start := s.now().UTC()
 
-	due, err := s.repo.FindDue(ctx, DueFilter{AsOf: start, IncludeSent: false})
+	// nil: the sweep is not scoped to any one user. See the Service and
+	// Repository comments on FindDue for why that is the deliberate exception
+	// to every other userID parameter in this codebase.
+	due, err := s.repo.FindDue(ctx, nil, DueFilter{AsOf: start, IncludeSent: false})
 	if err != nil {
 		return nil, fmt.Errorf("notifications: find due reminders: %w", err)
 	}
@@ -154,17 +166,17 @@ func (s *service) CheckReminders(ctx context.Context) (*RunSummary, error) {
 	return summary, nil
 }
 
-// ListDue backs GET /notifications/due.
+// ListDue backs GET /notifications/due, scoped to the caller.
 //
 // IncludeSent is true here and false in the sweep, and that difference is the
 // whole design: the sweep must not raise the same reminder twice in a day, but
 // the dashboard opened at noon should still show what was raised at 08:00.
 // Dismissing is what removes a reminder from this list, and that happens in the
 // applications module when the application stops being Applied.
-func (s *service) ListDue(ctx context.Context) ([]Notification, error) {
+func (s *service) ListDue(ctx context.Context, userID uuid.UUID) ([]Notification, error) {
 	now := s.now().UTC()
 
-	due, err := s.repo.FindDue(ctx, DueFilter{AsOf: now, IncludeSent: true})
+	due, err := s.repo.FindDue(ctx, &userID, DueFilter{AsOf: now, IncludeSent: true})
 	if err != nil {
 		return nil, fmt.Errorf("notifications: find due reminders: %w", err)
 	}

@@ -15,61 +15,76 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
+// testUserID is the caller every request in this file is authenticated as —
+// see middleware.TestContextWithUserID for why these tests inject it directly
+// rather than running a real RequireAuth in front of the router.
+var testUserID = uuid.New()
+
 type mockService struct {
-	match        func(ctx context.Context, q MatchQuery) (*MatchResult, error)
-	upload       func(ctx context.Context, in UploadInput) (*UploadResult, error)
-	list         func(ctx context.Context) ([]CV, error)
-	listVersions func(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error)
-	download     func(ctx context.Context, cvID, versionID uuid.UUID) (*DownloadLink, error)
-	usage        func(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error)
+	match        func(ctx context.Context, userID uuid.UUID, q MatchQuery) (*MatchResult, error)
+	upload       func(ctx context.Context, userID uuid.UUID, in UploadInput) (*UploadResult, error)
+	list         func(ctx context.Context, userID uuid.UUID) ([]CV, error)
+	listVersions func(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error)
+	download     func(ctx context.Context, userID, cvID, versionID uuid.UUID) (*DownloadLink, error)
+	usage        func(ctx context.Context, userID, versionID uuid.UUID) ([]ApplicationUsage, error)
 
 	lastMatchQuery  MatchQuery
 	lastUploadInput UploadInput
+	lastUser        uuid.UUID
 }
 
-func (m *mockService) Match(ctx context.Context, q MatchQuery) (*MatchResult, error) {
-	m.lastMatchQuery = q
+func (m *mockService) Match(ctx context.Context, userID uuid.UUID, q MatchQuery) (*MatchResult, error) {
+	m.lastMatchQuery, m.lastUser = q, userID
 	if m.match != nil {
-		return m.match(ctx, q)
+		return m.match(ctx, userID, q)
 	}
 	return &MatchResult{Outcome: OutcomeUnknown}, nil
 }
 
-func (m *mockService) Upload(ctx context.Context, in UploadInput) (*UploadResult, error) {
-	m.lastUploadInput = in
+func (m *mockService) Upload(ctx context.Context, userID uuid.UUID, in UploadInput) (*UploadResult, error) {
+	m.lastUploadInput, m.lastUser = in, userID
 	if m.upload != nil {
-		return m.upload(ctx, in)
+		return m.upload(ctx, userID, in)
 	}
 	cv := &CV{ID: uuid.New(), Name: "CV"}
 	return &UploadResult{CV: cv, Version: &CVVersion{ID: uuid.New(), CVID: cv.ID}}, nil
 }
 
-func (m *mockService) ListWithVersions(ctx context.Context) ([]CV, error) {
+func (m *mockService) ListWithVersions(ctx context.Context, userID uuid.UUID) ([]CV, error) {
+	m.lastUser = userID
 	if m.list != nil {
-		return m.list(ctx)
+		return m.list(ctx, userID)
 	}
 	return nil, nil
 }
 
-func (m *mockService) ListVersions(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error) {
+func (m *mockService) ListVersions(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error) {
+	m.lastUser = userID
 	if m.listVersions != nil {
-		return m.listVersions(ctx, cvID)
+		return m.listVersions(ctx, userID, cvID)
 	}
 	return nil, nil
 }
 
-func (m *mockService) DownloadURL(ctx context.Context, cvID, versionID uuid.UUID) (*DownloadLink, error) {
+func (m *mockService) DownloadURL(ctx context.Context, userID, cvID, versionID uuid.UUID) (*DownloadLink, error) {
+	m.lastUser = userID
 	if m.download != nil {
-		return m.download(ctx, cvID, versionID)
+		return m.download(ctx, userID, cvID, versionID)
 	}
 	return &DownloadLink{URL: "https://s3.example/x", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 
-func (m *mockService) ApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error) {
+func (m *mockService) ApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) (
+	[]ApplicationUsage,
+	error,
+) {
+	m.lastUser = userID
 	if m.usage != nil {
-		return m.usage(ctx, versionID)
+		return m.usage(ctx, userID, versionID)
 	}
 	return nil, nil
 }
@@ -84,6 +99,7 @@ func newTestServer(svc Service) chi.Router {
 
 func do(t *testing.T, r chi.Router, req *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	req = req.WithContext(middleware.TestContextWithUserID(req.Context(), testUserID))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -119,6 +135,9 @@ func TestHandlerMatch_PassesHashNameAndSizeThrough(t *testing.T) {
 	}
 	if got.FileSizeBytes == nil || *got.FileSizeBytes != 4096 {
 		t.Error("file size was not passed to the service")
+	}
+	if svc.lastUser != testUserID {
+		t.Errorf("userID passed to service = %s, want %s", svc.lastUser, testUserID)
 	}
 }
 
@@ -185,7 +204,7 @@ func TestHandlerMatch_SerialisesEachOutcome(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := &mockService{match: func(context.Context, MatchQuery) (*MatchResult, error) {
+			svc := &mockService{match: func(context.Context, uuid.UUID, MatchQuery) (*MatchResult, error) {
 				return tc.result, nil
 			}}
 			mux := newTestServer(svc)
@@ -224,7 +243,7 @@ func TestHandlerMatch_InvalidJSON(t *testing.T) {
 }
 
 func TestHandlerMatch_MissingFilenameIsBadRequest(t *testing.T) {
-	svc := &mockService{match: func(context.Context, MatchQuery) (*MatchResult, error) {
+	svc := &mockService{match: func(context.Context, uuid.UUID, MatchQuery) (*MatchResult, error) {
 		return nil, ErrFilenameEmpty
 	}}
 	mux := newTestServer(svc)
@@ -235,7 +254,7 @@ func TestHandlerMatch_MissingFilenameIsBadRequest(t *testing.T) {
 }
 
 func TestHandlerMatch_ServiceFailureIs500(t *testing.T) {
-	svc := &mockService{match: func(context.Context, MatchQuery) (*MatchResult, error) {
+	svc := &mockService{match: func(context.Context, uuid.UUID, MatchQuery) (*MatchResult, error) {
 		return nil, errors.New("neon is down")
 	}}
 	mux := newTestServer(svc)
@@ -319,7 +338,7 @@ func TestHandlerUpload_WithCVIDAndTag(t *testing.T) {
 }
 
 func TestHandlerUpload_AlreadyExistingVersionReturns200(t *testing.T) {
-	svc := &mockService{upload: func(context.Context, UploadInput) (*UploadResult, error) {
+	svc := &mockService{upload: func(context.Context, uuid.UUID, UploadInput) (*UploadResult, error) {
 		cv := &CV{ID: uuid.New()}
 		return &UploadResult{CV: cv, Version: &CVVersion{ID: uuid.New(), CVID: cv.ID}, AlreadyExisted: true}, nil
 	}}
@@ -351,7 +370,7 @@ func TestHandlerUpload_BadCVID(t *testing.T) {
 }
 
 func TestHandlerUpload_TooLargeIs413(t *testing.T) {
-	svc := &mockService{upload: func(context.Context, UploadInput) (*UploadResult, error) {
+	svc := &mockService{upload: func(context.Context, uuid.UUID, UploadInput) (*UploadResult, error) {
 		return nil, ErrFileTooLarge
 	}}
 	mux := newTestServer(svc)
@@ -385,7 +404,7 @@ func TestHandlerListVersions_BadUUIDIs400(t *testing.T) {
 }
 
 func TestHandlerListVersions_UnknownCVIs404(t *testing.T) {
-	svc := &mockService{listVersions: func(context.Context, uuid.UUID) ([]CVVersion, error) {
+	svc := &mockService{listVersions: func(context.Context, uuid.UUID, uuid.UUID) ([]CVVersion, error) {
 		return nil, ErrCVNotFound
 	}}
 	mux := newTestServer(svc)
@@ -400,7 +419,7 @@ func TestHandlerDownload_ReturnsPresignedURL(t *testing.T) {
 	expires := time.Now().Add(15 * time.Minute).UTC().Truncate(time.Second)
 	var gotCV, gotVersion uuid.UUID
 
-	svc := &mockService{download: func(_ context.Context, cv, version uuid.UUID) (*DownloadLink, error) {
+	svc := &mockService{download: func(_ context.Context, _ uuid.UUID, cv, version uuid.UUID) (*DownloadLink, error) {
 		gotCV, gotVersion = cv, version
 		return &DownloadLink{URL: "https://s3.example/signed", Filename: "cv.pdf", ExpiresAt: expires}, nil
 	}}
@@ -424,7 +443,7 @@ func TestHandlerDownload_ReturnsPresignedURL(t *testing.T) {
 }
 
 func TestHandlerDownload_VersionNotFoundIs404(t *testing.T) {
-	svc := &mockService{download: func(context.Context, uuid.UUID, uuid.UUID) (*DownloadLink, error) {
+	svc := &mockService{download: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*DownloadLink, error) {
 		return nil, ErrVersionNotFound
 	}}
 	mux := newTestServer(svc)

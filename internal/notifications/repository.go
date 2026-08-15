@@ -21,11 +21,18 @@ import (
 // Creating and dismissing reminders is deliberately absent. Both happen during
 // an application save or status change and belong to that module's transaction;
 // this one only reads reminders and marks them sent.
+//
+// Phase 15: FindDue's userID is nullable, and that is the whole design. The
+// scheduler has no request and no single user in mind — its sweep passes nil
+// and reads everyone's due reminders in one pass, exactly as it always has.
+// GET /notifications/due has a real caller and passes their id, so it only
+// ever sees its own.
 type Repository interface {
 	// FindDue returns reminders that have come due, oldest first, with their
 	// application snapshot attached. An empty result is the normal outcome on
-	// most days, not an error.
-	FindDue(ctx context.Context, f DueFilter) ([]FollowUpReminder, error)
+	// most days, not an error. userID nil means "everyone" — the scheduler's
+	// sweep; non-nil means "this user only" — the dashboard poll.
+	FindDue(ctx context.Context, userID *uuid.UUID, f DueFilter) ([]FollowUpReminder, error)
 	// MarkSent stamps sent_at. It reports (false, nil) when there was nothing to
 	// stamp — already sent, or dismissed between the sweep's read and this write
 	// — because a repeated run must be a no-op rather than a failure.
@@ -45,11 +52,15 @@ func NewRepository(q *sqlcdb.Queries) Repository {
 	return &postgresRepository{q: q}
 }
 
-func (r *postgresRepository) FindDue(ctx context.Context, f DueFilter) ([]FollowUpReminder, error) {
+func (r *postgresRepository) FindDue(ctx context.Context, userID *uuid.UUID, f DueFilter) (
+	[]FollowUpReminder,
+	error,
+) {
 	rows, err := r.q.FindDueFollowUpReminders(
 		ctx, sqlcdb.FindDueFollowUpRemindersParams{
 			AsOf:        f.AsOf,
 			IncludeSent: f.IncludeSent,
+			UserID:      userID,
 		},
 	)
 	if err != nil {

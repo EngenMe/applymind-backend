@@ -5,10 +5,11 @@
 //     the API Gateway proxy adapter.
 //   - Locally, it listens on PORT for ordinary HTTP.
 //
-// Phase 14 adds the auth module: /auth/register and /auth/login are public,
+// Phase 14 added the auth module: /auth/register and /auth/login are public,
 // the rest of /auth/* resolves a real user from a session cookie or an API
-// token. The existing module group deliberately stays on the static key for
-// one more phase — see the comment on that group.
+// token. Phase 15 folded every other module into the same authenticated
+// group and deleted the static-key middleware that used to guard them —
+// see pkg/middleware/auth.go.
 package main
 
 import (
@@ -201,54 +202,24 @@ func newRouter(
 	authHandler.RegisterPublicRoutes(r)
 
 	// Everything else under /auth/* resolves a real user — cookie for the
-	// dashboard, bearer token for the extension.
+	// dashboard, bearer token for the extension. Every other module lives in
+	// the same group: phase 15 made their queries user-aware, so there is no
+	// module left that needs a different (or no) credential.
 	r.Group(
 		func(authed chi.Router) {
 			authed.Use(middleware.RequireAuth(authSvc, logger))
 			authHandler.RegisterProtectedRoutes(authed, middleware.UserIDFromRequest)
-		},
-	)
-
-	// chi bakes a group's middleware onto each handler it registers, not onto
-	// the router as a whole. A method with no registered handler anywhere —
-	// this API has no PUT route at all, for instance — never reaches
-	// RequireAuth; chi answers 405 straight out of its routing tree first,
-	// with an Allow header that discloses which methods do exist at that
-	// path. That is more than a read-only credential should learn, and the
-	// phase's own test list requires a write attempt to get the same 403
-	// read_only_token a supported write gets, regardless of whether a handler
-	// happens to exist. This is the one place that has to run before routing
-	// decides a method doesn't exist, which is why it is wired at the Mux
-	// root rather than inside a group.
-	//
-	// Every credential that is not a read-only token — no credential, the
-	// static key, a full-access session or token — is unaffected: this only
-	// changes the response when CheckReadOnlyWrite's own identity resolution
-	// succeeds and finds IsReadOnly, and it costs one DB lookup, so it only
-	// runs at all when a request actually presents something that looks like
-	// a credential.
-	r.MethodNotAllowed(readOnlyMethodNotAllowed(authSvc))
-
-	r.Group(
-		func(protected chi.Router) {
-			// Still the static key, deliberately, for exactly this phase. The
-			// modules below ignore user_id: putting them behind RequireAuth now
-			// would identify the caller and then serve them every user's rows,
-			// which is a worse outcome than the shared key. Phase 15 makes
-			// these queries user-aware and flips this group over in the same
-			// change, which is also when LegacyStaticKeyAuth is deleted.
-			protected.Use(middleware.LegacyStaticKeyAuth(cfg.APIKey))
 
 			cvSvc := cvs.NewService(cvs.NewRepository(queries), cvStore)
-			cvs.NewHandler(cvSvc, logger).RegisterRoutes(protected)
+			cvs.NewHandler(cvSvc, logger).RegisterRoutes(authed)
 
 			clSvc := coverletters.NewService(coverletters.NewRepository(queries), cvStore)
-			coverletters.NewHandler(clSvc, logger).RegisterRoutes(protected)
+			coverletters.NewHandler(clSvc, logger).RegisterRoutes(authed)
 
 			// settings owns the profile summary the AI score is calculated
 			// against, so it is built before applications and handed to it.
 			settingsSvc := settings.NewService(settings.NewRepository(queries))
-			settings.NewHandler(settingsSvc, logger).RegisterRoutes(protected)
+			settings.NewHandler(settingsSvc, logger).RegisterRoutes(authed)
 
 			// applications takes the pool as well as the queries: it is the first
 			// module that opens transactions of its own, so that a save writes the
@@ -265,12 +236,12 @@ func newRouter(
 				)
 			}
 			appSvc := applications.NewService(applications.NewRepository(pool, queries), clSvc, appOpts...)
-			applications.NewHandler(appSvc, logger).RegisterRoutes(protected)
+			applications.NewHandler(appSvc, logger).RegisterRoutes(authed)
 
 			// siteSvc is built in main() so it can seed the pre-configured list
 			// before the router ever serves a request; here it is only wired to
 			// its routes.
-			sites.NewHandler(siteSvc, logger).RegisterRoutes(protected)
+			sites.NewHandler(siteSvc, logger).RegisterRoutes(authed)
 
 			// notifications is the same service the scheduler runs, but Lambda 1
 			// only reads through it: GET /notifications/due tells the dashboard
@@ -281,9 +252,29 @@ func newRouter(
 				notifications.NewRepository(queries),
 				notifications.WithLogger(logger),
 			)
-			notifications.NewHandler(notifSvc, logger).RegisterRoutes(protected)
+			notifications.NewHandler(notifSvc, logger).RegisterRoutes(authed)
 		},
 	)
+
+	// chi bakes a group's middleware onto each handler it registers, not onto
+	// the router as a whole. A method with no registered handler anywhere —
+	// this API has no PUT route at all, for instance — never reaches
+	// RequireAuth; chi answers 405 straight out of its routing tree first,
+	// with an Allow header that discloses which methods do exist at that
+	// path. That is more than a read-only credential should learn, and the
+	// phase's own test list requires a write attempt to get the same 403
+	// read_only_token a supported write gets, regardless of whether a handler
+	// happens to exist. This is the one place that has to run before routing
+	// decides a method doesn't exist, which is why it is wired at the Mux
+	// root rather than inside a group.
+	//
+	// Every credential that is not a read-only token — no credential, a
+	// full-access session or token — is unaffected: this only changes the
+	// response when CheckReadOnlyWrite's own identity resolution succeeds and
+	// finds IsReadOnly, and it costs one DB lookup, so it only runs at all
+	// when a request actually presents something that looks like a
+	// credential.
+	r.MethodNotAllowed(readOnlyMethodNotAllowed(authSvc))
 
 	return r
 }

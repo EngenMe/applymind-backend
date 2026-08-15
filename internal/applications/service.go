@@ -19,7 +19,7 @@ import (
 // can be tested without S3 or a database, following the cvs.Storage precedent.
 // coverletters.Service satisfies it as written, so cmd/api wires it in directly.
 type CoverLetters interface {
-	SaveText(ctx context.Context, in coverletters.SaveTextInput) (*coverletters.CoverLetter, error)
+	SaveText(ctx context.Context, userID uuid.UUID, in coverletters.SaveTextInput) (*coverletters.CoverLetter, error)
 }
 
 // Scorer is the subset of the ai package this module needs. *ai.Client satisfies
@@ -37,29 +37,33 @@ type ProfileSummaries interface {
 }
 
 // Service is the business logic boundary for the applications module.
+//
+// Phase 15: every method takes the caller's userID as its second parameter,
+// straight after ctx. The handler reads it from the authenticated request
+// context — nothing here trusts a client-supplied value.
 type Service interface {
 	// Create saves an application, writes its first status history row and, when
 	// it lands in Applied, schedules a follow-up reminder. A company-name
 	// duplicate is reported in the result, never blocked.
-	Create(ctx context.Context, in CreateInput) (*CreateResult, error)
+	Create(ctx context.Context, userID uuid.UUID, in CreateInput) (*CreateResult, error)
 	// Get returns an application with its status history loaded.
-	Get(ctx context.Context, id uuid.UUID) (*Application, error)
-	List(ctx context.Context, f ListFilter) ([]Application, error)
+	Get(ctx context.Context, userID, id uuid.UUID) (*Application, error)
+	List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Application, error)
 	// Update edits captured job data. It cannot move the status.
-	Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Application, error)
+	Update(ctx context.Context, userID, id uuid.UUID, in UpdateInput) (*Application, error)
 	// UpdateStatus transitions the application and writes the audit row in the
 	// same transaction, so a status can never change without a history entry.
-	UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdateInput) (*Application, error)
+	UpdateStatus(ctx context.Context, userID, id uuid.UUID, in StatusUpdateInput) (*Application, error)
 	// Complete finishes an In Progress application — Flow 2's "Mark as
 	// Complete". It attaches the CV version and cover letter the external site
 	// received, moves the application to Applied and starts the follow-up clock,
 	// all in one call.
-	Complete(ctx context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error)
-	Delete(ctx context.Context, id uuid.UUID) error
+	Complete(ctx context.Context, userID, id uuid.UUID, in CompleteInput) (*CompleteResult, error)
+	Delete(ctx context.Context, userID, id uuid.UUID) error
 	// CheckDuplicate backs GET /applications/check-duplicate, letting the sidebar
 	// warn before the user commits to saving.
-	CheckDuplicate(ctx context.Context, q DuplicateQuery) (*DuplicateWarning, error)
-	StatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHistory, error)
+	CheckDuplicate(ctx context.Context, userID uuid.UUID, q DuplicateQuery) (*DuplicateWarning, error)
+	StatusHistory(ctx context.Context, userID, id uuid.UUID) ([]StatusHistory, error)
 }
 
 const (
@@ -162,7 +166,7 @@ func NewService(repo Repository, cl CoverLetters, opts ...ServiceOption) Service
 // means it cannot be inserted before the application row is committed anyway. If
 // saving it fails the application is deleted again, so a half-saved application
 // never survives.
-func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, error) {
+func (s *service) Create(ctx context.Context, userID uuid.UUID, in CreateInput) (*CreateResult, error) {
 	company := strings.TrimSpace(in.CompanyName)
 	if company == "" {
 		return nil, ErrCompanyRequired
@@ -192,14 +196,17 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 		return nil, ErrCoverLettersUnavailable
 	}
 
-	siteID, err := s.resolveSiteID(ctx, in.SiteID, jobURL)
+	siteID, err := s.resolveSiteID(ctx, userID, in.SiteID, jobURL)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkCVVersionOwnership(ctx, userID, in.CVVersionID); err != nil {
 		return nil, err
 	}
 
 	// Flow 1, steps 19–20. A match is a warning the caller may act on; it never
 	// stops the save. Embedding-based similarity is a later phase.
-	warning, err := s.CheckDuplicate(ctx, DuplicateQuery{Company: company, JobTitle: title, SiteID: &siteID})
+	warning, err := s.CheckDuplicate(ctx, userID, DuplicateQuery{Company: company, JobTitle: title, SiteID: &siteID})
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +232,7 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 			app, err := tx.Create(
 				ctx, NewApplication{
 					ID:             s.newID(),
+					UserID:         userID,
 					CompanyName:    company,
 					JobTitle:       title,
 					JobDescription: in.JobDescription,
@@ -245,7 +253,7 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 			// an AI failure — the fail-soft branch is above — and it fails the
 			// save like any other write in this transaction would.
 			if score != nil {
-				scored, err := tx.SetAIScore(ctx, app.ID, score.Score, optionalString(score.Explanation))
+				scored, err := tx.SetAIScore(ctx, userID, app.ID, score.Score, optionalString(score.Explanation))
 				if err != nil {
 					return err
 				}
@@ -256,6 +264,7 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 			if _, err := tx.CreateStatusHistory(
 				ctx, NewStatusHistory{
 					ApplicationID: app.ID,
+					UserID:        userID,
 					FromStatus:    nil,
 					ToStatus:      status,
 					ChangedBy:     ChangeSourceUser,
@@ -266,7 +275,7 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 			}
 
 			if dueAt != nil {
-				if err := tx.EnsurePendingReminder(ctx, app.ID, *dueAt); err != nil {
+				if err := tx.EnsurePendingReminder(ctx, userID, app.ID, *dueAt); err != nil {
 					return err
 				}
 			}
@@ -281,14 +290,14 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 
 	if coverLetter != "" {
 		if _, err := s.coverLetters.SaveText(
-			ctx, coverletters.SaveTextInput{
+			ctx, userID, coverletters.SaveTextInput{
 				ApplicationID: created.ID,
 				BodyText:      coverLetter,
 			},
 		); err != nil {
 			// Compensating action for the one write that could not join the
 			// transaction. The cascade takes the history row and reminder with it.
-			_ = s.repo.Delete(ctx, created.ID)
+			_ = s.repo.Delete(ctx, userID, created.ID)
 			return nil, fmt.Errorf("applications: save cover letter: %w", err)
 		}
 	}
@@ -296,12 +305,12 @@ func (s *service) Create(ctx context.Context, in CreateInput) (*CreateResult, er
 	return &CreateResult{Application: created, Duplicate: warning, FollowUpDueAt: dueAt}, nil
 }
 
-func (s *service) Get(ctx context.Context, id uuid.UUID) (*Application, error) {
-	app, err := s.repo.Get(ctx, id)
+func (s *service) Get(ctx context.Context, userID, id uuid.UUID) (*Application, error) {
+	app, err := s.repo.Get(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
-	history, err := s.repo.ListStatusHistory(ctx, id)
+	history, err := s.repo.ListStatusHistory(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +318,7 @@ func (s *service) Get(ctx context.Context, id uuid.UUID) (*Application, error) {
 	return app, nil
 }
 
-func (s *service) List(ctx context.Context, f ListFilter) ([]Application, error) {
+func (s *service) List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Application, error) {
 	if f.Status != nil && !f.Status.Valid() {
 		return nil, ErrInvalidStatus
 	}
@@ -325,10 +334,10 @@ func (s *service) List(ctx context.Context, f ListFilter) ([]Application, error)
 	f.Company = trimmedOrNil(f.Company)
 	f.Search = trimmedOrNil(f.Search)
 
-	return s.repo.List(ctx, f)
+	return s.repo.List(ctx, userID, f)
 }
 
-func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Application, error) {
+func (s *service) Update(ctx context.Context, userID, id uuid.UUID, in UpdateInput) (*Application, error) {
 	company := strings.TrimSpace(in.CompanyName)
 	if company == "" {
 		return nil, ErrCompanyRequired
@@ -342,14 +351,17 @@ func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Ap
 		return nil, ErrJobURLRequired
 	}
 
-	// Confirms the application exists before touching anything, so a bad id is a
-	// 404 rather than a silent no-op.
-	if _, err := s.repo.Get(ctx, id); err != nil {
+	// Confirms the application exists (and belongs to this user) before
+	// touching anything, so a bad id is a 404 rather than a silent no-op.
+	if _, err := s.repo.Get(ctx, userID, id); err != nil {
 		return nil, err
 	}
 
-	siteID, err := s.resolveSiteID(ctx, in.SiteID, jobURL)
+	siteID, err := s.resolveSiteID(ctx, userID, in.SiteID, jobURL)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkCVVersionOwnership(ctx, userID, in.CVVersionID); err != nil {
 		return nil, err
 	}
 
@@ -357,7 +369,7 @@ func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Ap
 	// Re-scoring on edit is deliberately not done: it is not in this phase's
 	// scope, and an edit is usually a typo fix rather than a new posting.
 	return s.repo.Update(
-		ctx, id, UpdateFields{
+		ctx, userID, id, UpdateFields{
 			CompanyName:    company,
 			JobTitle:       title,
 			JobDescription: in.JobDescription,
@@ -368,7 +380,10 @@ func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*Ap
 	)
 }
 
-func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdateInput) (*Application, error) {
+func (s *service) UpdateStatus(ctx context.Context, userID, id uuid.UUID, in StatusUpdateInput) (
+	*Application,
+	error,
+) {
 	if !in.Status.Valid() {
 		return nil, ErrInvalidStatus
 	}
@@ -380,7 +395,7 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 		return nil, ErrInvalidChangeSource
 	}
 
-	current, err := s.repo.Get(ctx, id)
+	current, err := s.repo.Get(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +414,7 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 	var updated *Application
 	err = s.repo.Tx(
 		ctx, func(tx Repository) error {
-			app, err := tx.UpdateStatus(ctx, id, in.Status, appliedAt)
+			app, err := tx.UpdateStatus(ctx, userID, id, in.Status, appliedAt)
 			if err != nil {
 				return err
 			}
@@ -408,6 +423,7 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 			if _, err := tx.CreateStatusHistory(
 				ctx, NewStatusHistory{
 					ApplicationID: id,
+					UserID:        userID,
 					FromStatus:    &from,
 					ToStatus:      in.Status,
 					ChangedBy:     changedBy,
@@ -426,10 +442,10 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 					now := s.now().UTC()
 					at = &now
 				}
-				if err := tx.EnsurePendingReminder(ctx, id, FollowUpDueAt(*at, s.followUpDelay)); err != nil {
+				if err := tx.EnsurePendingReminder(ctx, userID, id, FollowUpDueAt(*at, s.followUpDelay)); err != nil {
 					return err
 				}
-			} else if err := tx.DismissPendingReminders(ctx, id); err != nil {
+			} else if err := tx.DismissPendingReminders(ctx, userID, id); err != nil {
 				return err
 			}
 
@@ -462,8 +478,8 @@ func (s *service) UpdateStatus(ctx context.Context, id uuid.UUID, in StatusUpdat
 // Scoring deliberately does not run here. The job description was captured on
 // LinkedIn and scored when the partial application was created; re-scoring the
 // same description would spend a model call to arrive at the same answer.
-func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
-	current, err := s.repo.Get(ctx, id)
+func (s *service) Complete(ctx context.Context, userID, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
+	current, err := s.repo.Get(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -478,6 +494,9 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 	coverLetter := strings.TrimSpace(deref(in.CoverLetterText))
 	if coverLetter != "" && s.coverLetters == nil {
 		return nil, ErrCoverLettersUnavailable
+	}
+	if err := s.checkCVVersionOwnership(ctx, userID, in.CVVersionID); err != nil {
+		return nil, err
 	}
 
 	// applied_at records when the application was actually sent. Write-once, so
@@ -494,7 +513,7 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 
 	if coverLetter != "" {
 		if _, err := s.coverLetters.SaveText(
-			ctx, coverletters.SaveTextInput{
+			ctx, userID, coverletters.SaveTextInput{
 				ApplicationID: id,
 				BodyText:      coverLetter,
 			},
@@ -511,7 +530,7 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 			// the job is, only what was sent to it.
 			if in.CVVersionID != nil {
 				if _, err := tx.Update(
-					ctx, id, UpdateFields{
+					ctx, userID, id, UpdateFields{
 						CompanyName:    current.CompanyName,
 						JobTitle:       current.JobTitle,
 						JobDescription: current.JobDescription,
@@ -524,7 +543,7 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 				}
 			}
 
-			app, err := tx.UpdateStatus(ctx, id, StatusApplied, appliedAt)
+			app, err := tx.UpdateStatus(ctx, userID, id, StatusApplied, appliedAt)
 			if err != nil {
 				return err
 			}
@@ -533,6 +552,7 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 			if _, err := tx.CreateStatusHistory(
 				ctx, NewStatusHistory{
 					ApplicationID: id,
+					UserID:        userID,
 					FromStatus:    &from,
 					ToStatus:      StatusApplied,
 					ChangedBy:     ChangeSourceUser,
@@ -542,7 +562,7 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 				return err
 			}
 
-			if err := tx.EnsurePendingReminder(ctx, id, dueAt); err != nil {
+			if err := tx.EnsurePendingReminder(ctx, userID, id, dueAt); err != nil {
 				return err
 			}
 
@@ -557,26 +577,30 @@ func (s *service) Complete(ctx context.Context, id uuid.UUID, in CompleteInput) 
 	return &CompleteResult{Application: completed, FollowUpDueAt: &dueAt}, nil
 }
 
-func (s *service) Delete(ctx context.Context, id uuid.UUID) error {
-	return s.repo.Delete(ctx, id)
+func (s *service) Delete(ctx context.Context, userID, id uuid.UUID) error {
+	return s.repo.Delete(ctx, userID, id)
 }
 
 // CheckDuplicate answers "have I been here before?" in three widening circles.
 //
-// The company match is exact and done in SQL. Everything after it is sorting:
-// which of those existing applications look like this same job, and which of
-// those were saved from a different site — the LinkedIn posting the user already
-// applied to, now in front of them again on the company's own board.
+// The company match is exact and done in SQL, scoped to this user. Everything
+// after it is sorting: which of those existing applications look like this same
+// job, and which of those were saved from a different site — the LinkedIn
+// posting the user already applied to, now in front of them again on the
+// company's own board.
 //
 // A company with no previous application returns (nil, nil), which every caller
 // reads as "nothing to say".
-func (s *service) CheckDuplicate(ctx context.Context, q DuplicateQuery) (*DuplicateWarning, error) {
+func (s *service) CheckDuplicate(ctx context.Context, userID uuid.UUID, q DuplicateQuery) (
+	*DuplicateWarning,
+	error,
+) {
 	company := strings.TrimSpace(q.Company)
 	if company == "" {
 		return nil, ErrCompanyRequired
 	}
 
-	found, err := s.repo.FindByCompanyName(ctx, company)
+	found, err := s.repo.FindByCompanyName(ctx, userID, company)
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +627,7 @@ func (s *service) CheckDuplicate(ctx context.Context, q DuplicateQuery) (*Duplic
 	// empty rather than failing a check that exists to be informative.
 	siteID := q.SiteID
 	if siteID == nil && strings.TrimSpace(q.JobURL) != "" {
-		if resolved, err := s.resolveSiteID(ctx, nil, strings.TrimSpace(q.JobURL)); err == nil {
+		if resolved, err := s.resolveSiteID(ctx, userID, nil, strings.TrimSpace(q.JobURL)); err == nil {
 			siteID = &resolved
 		}
 	}
@@ -620,11 +644,11 @@ func (s *service) CheckDuplicate(ctx context.Context, q DuplicateQuery) (*Duplic
 	return warning, nil
 }
 
-func (s *service) StatusHistory(ctx context.Context, id uuid.UUID) ([]StatusHistory, error) {
-	if _, err := s.repo.Get(ctx, id); err != nil {
+func (s *service) StatusHistory(ctx context.Context, userID, id uuid.UUID) ([]StatusHistory, error) {
+	if _, err := s.repo.Get(ctx, userID, id); err != nil {
 		return nil, err
 	}
-	return s.repo.ListStatusHistory(ctx, id)
+	return s.repo.ListStatusHistory(ctx, userID, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -702,19 +726,33 @@ func (s *service) scoreJob(ctx context.Context, company, title, jobDescription s
 // Helpers
 // ---------------------------------------------------------------------------
 
-// resolveSiteID trusts an explicit site_id when the caller sends one, and
-// otherwise derives the site from the job URL's host — Flow 1's payload carries
-// the URL but never the site.
-func (s *service) resolveSiteID(ctx context.Context, explicit *uuid.UUID, jobURL string) (uuid.UUID, error) {
+// resolveSiteID trusts an explicit site_id only after confirming it is global
+// or owned by userID, and otherwise derives the site from the job URL's host —
+// Flow 1's payload carries the URL but never the site.
+//
+// Validating an explicit id here, rather than only in the write's own SQL
+// guard, is what turns "another user's site_id" into a clear ErrSiteNotFound
+// instead of a generic write failure — see the comment on Repository.FindSiteByID.
+func (s *service) resolveSiteID(ctx context.Context, userID uuid.UUID, explicit *uuid.UUID, jobURL string) (
+	uuid.UUID,
+	error,
+) {
 	if explicit != nil {
-		return *explicit, nil
+		site, err := s.repo.FindSiteByID(ctx, userID, *explicit)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		if site == nil {
+			return uuid.Nil, ErrSiteNotFound
+		}
+		return site.ID, nil
 	}
 
 	domain, err := domainFromURL(jobURL)
 	if err != nil {
 		return uuid.Nil, ErrSiteUnresolvable
 	}
-	site, err := s.repo.FindSiteByDomain(ctx, domain)
+	site, err := s.repo.FindSiteByDomain(ctx, userID, domain)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -722,6 +760,26 @@ func (s *service) resolveSiteID(ctx context.Context, explicit *uuid.UUID, jobURL
 		return uuid.Nil, ErrSiteNotFound
 	}
 	return site.ID, nil
+}
+
+// checkCVVersionOwnership confirms an explicit cv_version_id belongs to userID
+// before it reaches a write. nil is always fine — no CV attached is a normal
+// save. This is deliberately a separate check from resolveSiteID's, rather than
+// one combined guard, so Create and Update can report ErrCVVersionNotFound
+// specifically instead of a generic failure — see CVVersionOwnedByUser's own
+// comment for why the atomic SQL guard alone cannot give that distinction.
+func (s *service) checkCVVersionOwnership(ctx context.Context, userID uuid.UUID, cvVersionID *uuid.UUID) error {
+	if cvVersionID == nil {
+		return nil
+	}
+	owned, err := s.repo.CVVersionOwnedByUser(ctx, userID, *cvVersionID)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return ErrCVVersionNotFound
+	}
+	return nil
 }
 
 // appliedAtFor stamps the moment of application. An explicit value wins (the

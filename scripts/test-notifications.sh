@@ -2,7 +2,7 @@
 # Manual smoke test for the `notifications` module over curl.
 #
 # Usage:
-#   BASE_URL=http://localhost:8080 API_KEY=devkey123 ./test-notifications.sh
+#   BASE_URL=http://localhost:8080 ./test-notifications.sh
 #
 # Optional (lets the script prove a *due* reminder actually appears, not just
 # that the endpoint responds):
@@ -14,21 +14,51 @@
 #   out (applications.DefaultFollowUpDelay) and won't show up on its own.
 #
 # Assumptions — adjust if your setup differs:
-#   - Auth header is `Authorization: Bearer <API_KEY>`, matching
-#     test-applications.sh.
+#   - Phase 15 removed the shared static API key; every route now requires a
+#     real user. This script registers a throwaway account, issues it a bearer
+#     API token the same way the extension would, and uses that token for
+#     everything below. The account is left behind — see test-auth.sh's header
+#     comment for the cleanup query.
 #   - migrations/000010_seed_sites.up.sql seeds domain "linkedin.com"
-#     (is_active = true), so an application can be created via job_url alone.
+#     (is_active = true, global — user_id IS NULL), so an application can be
+#     created via job_url alone.
 #   - jq is installed. psql is only needed for the optional DATABASE_URL step.
 
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-API_KEY="${API_KEY:-devkey}"
 JOB_URL="https://www.linkedin.com/jobs/view/notiftest-$RANDOM"
 COMPANY="Notif Smoketest Inc $RANDOM"
 
-AUTH=(-H "Authorization: Bearer ${API_KEY}")
 JSON=(-H "Content-Type: application/json")
+
+# --- Authenticate ----------------------------------------------------------
+AUTH_EMAIL="smoke-notifications-$RANDOM$RANDOM@example.com"
+AUTH_PASSWORD="smoke-password-1234"
+AUTH_COOKIES=$(mktemp)
+
+reg_code=$(curl -sS -o /tmp/notif_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/register" \
+  -d "$(jq -n --arg e "$AUTH_EMAIL" --arg p "$AUTH_PASSWORD" '{email: $e, password: $p, display_name: "Smoke Test"}')")
+if [ "$reg_code" != "201" ]; then
+  echo "Could not register a throwaway account (HTTP $reg_code) — cannot authenticate."
+  cat /tmp/notif_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+
+token_code=$(curl -sS -o /tmp/notif_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/tokens" -d '{"name":"smoke test token"}')
+if [ "$token_code" != "201" ]; then
+  echo "Could not issue an API token (HTTP $token_code) — cannot authenticate."
+  cat /tmp/notif_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+API_TOKEN=$(jq -r '.token' /tmp/notif_auth_body)
+rm -f "$AUTH_COOKIES"
+
+AUTH=(-H "Authorization: Bearer ${API_TOKEN}")
 
 pass=0
 fail=0

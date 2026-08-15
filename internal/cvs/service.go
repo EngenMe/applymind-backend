@@ -24,15 +24,19 @@ type Storage interface {
 }
 
 // Service is the business logic boundary for the cvs module.
+//
+// Phase 15: every method takes the caller's userID as its second parameter,
+// straight after ctx. The handler reads it from the authenticated request
+// context — nothing here trusts a client-supplied value.
 type Service interface {
 	// Match runs the Flow 3 decision tree. It has no side effects — the
 	// extension calls it on every file input change event.
-	Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
-	Upload(ctx context.Context, in UploadInput) (*UploadResult, error)
-	ListWithVersions(ctx context.Context) ([]CV, error)
-	ListVersions(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error)
-	DownloadURL(ctx context.Context, cvID, versionID uuid.UUID) (*DownloadLink, error)
-	ApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error)
+	Match(ctx context.Context, userID uuid.UUID, q MatchQuery) (*MatchResult, error)
+	Upload(ctx context.Context, userID uuid.UUID, in UploadInput) (*UploadResult, error)
+	ListWithVersions(ctx context.Context, userID uuid.UUID) ([]CV, error)
+	ListVersions(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error)
+	DownloadURL(ctx context.Context, userID, cvID, versionID uuid.UUID) (*DownloadLink, error)
+	ApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) ([]ApplicationUsage, error)
 }
 
 const (
@@ -88,8 +92,9 @@ func NewService(repo Repository, store Storage, opts ...ServiceOption) Service {
 //	Decision 4  filename match, size differs     → Terminal Outcome 2 (new_version)
 //
 // A missing hash (Decision 1 = NO in the browser) skips Decision 2 rather than
-// querying for an empty hash.
-func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error) {
+// querying for an empty hash. Every lookup is scoped to userID, so this can
+// never surface — or silently attach to — another user's CV.
+func (s *service) Match(ctx context.Context, userID uuid.UUID, q MatchQuery) (*MatchResult, error) {
 	filename := strings.TrimSpace(q.Filename)
 	if filename == "" {
 		return nil, ErrFilenameEmpty
@@ -97,12 +102,12 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 
 	// Decision 2 — hash is canonical identity.
 	if hash := strings.TrimSpace(q.SHA256Hash); hash != "" {
-		version, err := s.repo.FindVersionByHash(ctx, hash)
+		version, err := s.repo.FindVersionByHash(ctx, userID, hash)
 		if err != nil {
 			return nil, err
 		}
 		if version != nil {
-			cv, err := s.repo.GetCV(ctx, version.CVID)
+			cv, err := s.repo.GetCV(ctx, userID, version.CVID)
 			if err != nil {
 				return nil, err
 			}
@@ -116,7 +121,7 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 	}
 
 	// Decision 3 — does any stored file carry this filename?
-	latest, err := s.repo.FindLatestVersionByFilename(ctx, filename)
+	latest, err := s.repo.FindLatestVersionByFilename(ctx, userID, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +129,7 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 		return &MatchResult{Outcome: OutcomeUnknown}, nil
 	}
 
-	cv, err := s.repo.GetCV(ctx, latest.CVID)
+	cv, err := s.repo.GetCV(ctx, userID, latest.CVID)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +138,7 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 	// cannot run. Ask the user rather than guessing.
 	if q.FileSizeBytes == nil {
 		details := &ConfirmationDetails{CVName: cv.Name}
-		usage, err := s.repo.LastUsageForCV(ctx, cv.ID)
+		usage, err := s.repo.LastUsageForCV(ctx, userID, cv.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -152,7 +157,7 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 
 	// Decision 4 — same name and same size within this CV group is treated as
 	// the same file.
-	sized, err := s.repo.FindVersionByCVAndSize(ctx, cv.ID, *q.FileSizeBytes)
+	sized, err := s.repo.FindVersionByCVAndSize(ctx, userID, cv.ID, *q.FileSizeBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +180,7 @@ func (s *service) Match(ctx context.Context, q MatchQuery) (*MatchResult, error)
 // When in.CVID is set the version joins that existing CV group (this is how the
 // extension acts on OutcomeNewVersion). When it is nil a new CV group is created,
 // named after the file.
-func (s *service) Upload(ctx context.Context, in UploadInput) (*UploadResult, error) {
+func (s *service) Upload(ctx context.Context, userID uuid.UUID, in UploadInput) (*UploadResult, error) {
 	filename := strings.TrimSpace(in.Filename)
 	if filename == "" {
 		return nil, ErrFilenameEmpty
@@ -196,26 +201,26 @@ func (s *service) Upload(ctx context.Context, in UploadInput) (*UploadResult, er
 		err        error
 	)
 	if in.CVID != nil {
-		cv, err = s.repo.GetCV(ctx, *in.CVID)
+		cv, err = s.repo.GetCV(ctx, userID, *in.CVID)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		var name string
-		name, err = s.availableCVName(ctx, deriveCVName(filename))
+		name, err = s.availableCVName(ctx, userID, deriveCVName(filename))
 		if err != nil {
 			return nil, err
 		}
-		cv, err = s.repo.CreateCV(ctx, name, in.Tag)
+		cv, err = s.repo.CreateCV(ctx, userID, name, in.Tag)
 		if err != nil {
 			return nil, err
 		}
 		createdNew = true
 	}
 
-	// unique(cv_id, sha256_hash): these exact bytes may already be recorded under
-	// this CV. Re-uploading is a no-op rather than an error.
-	if existing, err := s.repo.FindVersionByCVAndHash(ctx, cv.ID, hash); err != nil {
+	// unique(user_id, cv_id, sha256_hash): these exact bytes may already be
+	// recorded under this CV. Re-uploading is a no-op rather than an error.
+	if existing, err := s.repo.FindVersionByCVAndHash(ctx, userID, cv.ID, hash); err != nil {
 		return nil, err
 	} else if existing != nil {
 		return &UploadResult{CV: cv, Version: existing, AlreadyExisted: true}, nil
@@ -230,13 +235,14 @@ func (s *service) Upload(ctx context.Context, in UploadInput) (*UploadResult, er
 	}
 	if err := s.storage.Upload(ctx, key, in.Content, contentType); err != nil {
 		if createdNew {
-			_ = s.repo.DeleteCV(ctx, cv.ID)
+			_ = s.repo.DeleteCV(ctx, userID, cv.ID)
 		}
 		return nil, fmt.Errorf("cvs: upload to storage: %w", err)
 	}
 
 	version, err := s.repo.CreateVersion(ctx, NewVersion{
 		ID:               versionID,
+		UserID:           userID,
 		CVID:             cv.ID,
 		SHA256Hash:       hash,
 		FileSizeBytes:    int64(len(in.Content)),
@@ -247,7 +253,7 @@ func (s *service) Upload(ctx context.Context, in UploadInput) (*UploadResult, er
 		// Best effort: do not leave an object in S3 with no row pointing at it.
 		_ = s.storage.Delete(ctx, key)
 		if createdNew {
-			_ = s.repo.DeleteCV(ctx, cv.ID)
+			_ = s.repo.DeleteCV(ctx, userID, cv.ID)
 		}
 		return nil, err
 	}
@@ -255,8 +261,8 @@ func (s *service) Upload(ctx context.Context, in UploadInput) (*UploadResult, er
 	return &UploadResult{CV: cv, Version: version}, nil
 }
 
-func (s *service) ListWithVersions(ctx context.Context) ([]CV, error) {
-	cvs, err := s.repo.ListCVs(ctx)
+func (s *service) ListWithVersions(ctx context.Context, userID uuid.UUID) ([]CV, error) {
+	cvs, err := s.repo.ListCVs(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +270,7 @@ func (s *service) ListWithVersions(ctx context.Context) ([]CV, error) {
 		return []CV{}, nil
 	}
 
-	versions, err := s.repo.ListAllVersions(ctx)
+	versions, err := s.repo.ListAllVersions(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -285,15 +291,15 @@ func (s *service) ListWithVersions(ctx context.Context) ([]CV, error) {
 	return cvs, nil
 }
 
-func (s *service) ListVersions(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error) {
-	if _, err := s.repo.GetCV(ctx, cvID); err != nil {
+func (s *service) ListVersions(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error) {
+	if _, err := s.repo.GetCV(ctx, userID, cvID); err != nil {
 		return nil, err
 	}
-	return s.repo.ListVersionsForCV(ctx, cvID)
+	return s.repo.ListVersionsForCV(ctx, userID, cvID)
 }
 
-func (s *service) DownloadURL(ctx context.Context, cvID, versionID uuid.UUID) (*DownloadLink, error) {
-	version, err := s.repo.GetVersion(ctx, versionID)
+func (s *service) DownloadURL(ctx context.Context, userID, cvID, versionID uuid.UUID) (*DownloadLink, error) {
+	version, err := s.repo.GetVersion(ctx, userID, versionID)
 	if err != nil {
 		return nil, err
 	}
@@ -313,18 +319,21 @@ func (s *service) DownloadURL(ctx context.Context, cvID, versionID uuid.UUID) (*
 	}, nil
 }
 
-func (s *service) ApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error) {
-	if _, err := s.repo.GetVersion(ctx, versionID); err != nil {
+func (s *service) ApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) (
+	[]ApplicationUsage,
+	error,
+) {
+	if _, err := s.repo.GetVersion(ctx, userID, versionID); err != nil {
 		return nil, err
 	}
-	return s.repo.ListApplicationsUsingVersion(ctx, versionID)
+	return s.repo.ListApplicationsUsingVersion(ctx, userID, versionID)
 }
 
-// availableCVName resolves the unique constraint on cvs.name by suffixing.
-func (s *service) availableCVName(ctx context.Context, base string) (string, error) {
+// availableCVName resolves the unique(user_id, name) constraint by suffixing.
+func (s *service) availableCVName(ctx context.Context, userID uuid.UUID, base string) (string, error) {
 	candidate := base
 	for i := 2; i < 100; i++ {
-		_, err := s.repo.GetCVByName(ctx, candidate)
+		_, err := s.repo.GetCVByName(ctx, userID, candidate)
 		if errors.Is(err, ErrCVNotFound) {
 			return candidate, nil
 		}

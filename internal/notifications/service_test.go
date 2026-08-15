@@ -14,6 +14,12 @@ import (
 
 var fixedNow = time.Date(2026, 5, 20, 8, 0, 0, 0, time.UTC)
 
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too. ListDue tests
+// act as that caller; CheckReminders tests need no user at all, since the sweep
+// is global, which is what TestCheckRemindersAsksForPendingOnly asserts by
+// checking stubRepo.gotUserIDs is nil.
+
 // ---------------------------------------------------------------------------
 // Stubs
 // ---------------------------------------------------------------------------
@@ -22,16 +28,18 @@ type stubRepo struct {
 	due     []FollowUpReminder
 	findErr error
 
-	filters  []DueFilter
-	marked   []uuid.UUID
-	markedAt []time.Time
+	filters    []DueFilter
+	gotUserIDs []*uuid.UUID
+	marked     []uuid.UUID
+	markedAt   []time.Time
 
 	markErr    error
 	notPending map[uuid.UUID]bool
 }
 
-func (s *stubRepo) FindDue(_ context.Context, f DueFilter) ([]FollowUpReminder, error) {
+func (s *stubRepo) FindDue(_ context.Context, userID *uuid.UUID, f DueFilter) ([]FollowUpReminder, error) {
 	s.filters = append(s.filters, f)
+	s.gotUserIDs = append(s.gotUserIDs, userID)
 	if s.findErr != nil {
 		return nil, s.findErr
 	}
@@ -114,6 +122,9 @@ func TestCheckRemindersAsksForPendingOnly(t *testing.T) {
 	if !repo.filters[0].AsOf.Equal(fixedNow) {
 		t.Errorf("AsOf = %v, want %v", repo.filters[0].AsOf, fixedNow)
 	}
+	if repo.gotUserIDs[0] != nil {
+		t.Errorf("CheckReminders must pass a nil userID — the sweep is for every user, got %v", repo.gotUserIDs[0])
+	}
 }
 
 func TestListDueIncludesAlreadySentReminders(t *testing.T) {
@@ -124,13 +135,16 @@ func TestListDueIncludesAlreadySentReminders(t *testing.T) {
 	repo := &stubRepo{due: []FollowUpReminder{r}}
 	svc := newTestService(repo, &stubNotifier{})
 
-	out, err := svc.ListDue(context.Background())
+	out, err := svc.ListDue(context.Background(), testUserID)
 	if err != nil {
 		t.Fatalf("ListDue: %v", err)
 	}
 
 	if !repo.filters[0].IncludeSent {
 		t.Fatal("the dashboard poll must include sent reminders")
+	}
+	if repo.gotUserIDs[0] == nil || *repo.gotUserIDs[0] != testUserID {
+		t.Errorf("ListDue must scope FindDue to the caller, got %v want %s", repo.gotUserIDs[0], testUserID)
 	}
 	if len(out) != 1 {
 		t.Fatalf("want 1 notification, got %d", len(out))

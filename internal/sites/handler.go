@@ -10,12 +10,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
 // Handler exposes the sites module over HTTP via chi, matching the router set up
-// in cmd/api/main.go. Register it inside the API-key-protected group:
+// in cmd/api/main.go. Register it inside the authenticated group:
 //
-//	sites.NewHandler(siteSvc, logger).RegisterRoutes(protected)
+//	sites.NewHandler(siteSvc, logger).RegisterRoutes(authed)
 type Handler struct {
 	svc    Service
 	logger *slog.Logger
@@ -38,6 +40,21 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 // pathParam is the single point of coupling to the router.
 func (h *Handler) pathParam(r *http.Request, name string) string {
 	return chi.URLParam(r, name)
+}
+
+// requireUser reads the authenticated caller. See the identical helper in
+// internal/auth and internal/cvs for why a missing user here is a 500, not a 401.
+func (h *Handler) requireUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		h.logger.ErrorContext(
+			r.Context(), "sites: no user in context on a protected route",
+			slog.String("path", r.URL.Path),
+		)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "something went wrong")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 // ---------------------------------------------------------------------------
@@ -68,10 +85,15 @@ type siteResponse struct {
 
 // List — GET /sites
 //
-// Returns every site, pre-configured and custom, which is what the dashboard
-// settings page needs. ?active=true narrows it to what the extension may
-// currently capture from.
+// Returns every site this caller can see — pre-configured plus their own
+// custom sites — which is what the dashboard settings page needs. ?active=true
+// narrows it to what the extension may currently capture from.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	var filter ListFilter
 	if raw := r.URL.Query().Get("active"); raw != "" {
 		active, err := strconv.ParseBool(raw)
@@ -82,7 +104,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		filter.ActiveOnly = active
 	}
 
-	sites, err := h.svc.List(r.Context(), filter)
+	sites, err := h.svc.List(r.Context(), userID, filter)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -95,12 +117,17 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 // Adds a user's own site. domain may be a bare host or a full URL; it is stored
 // normalised. The new site is custom (deletable) and active.
 func (h *Handler) Add(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	var req addRequest
 	if !h.decode(w, r, &req) {
 		return
 	}
 
-	site, err := h.svc.Add(r.Context(), AddInput{Name: req.Name, Domain: req.Domain})
+	site, err := h.svc.Add(r.Context(), userID, AddInput{Name: req.Name, Domain: req.Domain})
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -113,12 +140,16 @@ func (h *Handler) Add(w http.ResponseWriter, r *http.Request) {
 // Body-less: it flips whatever the current value is. Allowed on pre-configured
 // sites, which is how they are switched off without being removed.
 func (h *Handler) ToggleActive(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
 	}
 
-	site, err := h.svc.ToggleActive(r.Context(), id)
+	site, err := h.svc.ToggleActive(r.Context(), userID, id)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -131,12 +162,16 @@ func (h *Handler) ToggleActive(w http.ResponseWriter, r *http.Request) {
 // Custom sites only. Pre-configured sites and sites with applications attached
 // are both refused with a 409.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
 	}
 
-	if err := h.svc.Delete(r.Context(), id); err != nil {
+	if err := h.svc.Delete(r.Context(), userID, id); err != nil {
 		h.writeServiceError(w, r, err)
 		return
 	}

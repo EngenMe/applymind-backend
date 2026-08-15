@@ -2,27 +2,55 @@
 # Manual smoke test for the `applications` module over curl.
 #
 # Usage:
-#   BASE_URL=http://localhost:8080 API_KEY=devkey123 ./test-applications.sh
+#   BASE_URL=http://localhost:8080 ./test-applications.sh
 #
 # Assumptions — adjust if your setup differs:
-#   - Auth header is `Authorization: Bearer <API_KEY>` (matches Flow 1 step 10's
-#     annotation). If pkg/middleware/auth.go expects e.g. X-API-Key instead,
-#     change the `-H "Authorization: ..."` line below.
+#   - Phase 15 removed the shared static API key; every route now requires a
+#     real user. This script registers a throwaway account, issues it a bearer
+#     API token the same way the extension would, and uses that token for
+#     everything below. The account is left behind — see test-auth.sh's header
+#     comment for the cleanup query.
 #   - migrations/000010_seed_sites.up.sql seeds a row with domain "linkedin.com"
-#     (is_active = true) — that's what lets the site_id-resolution-from-job_url
-#     path succeed below without ever calling a /sites endpoint. If your seed
-#     uses a different domain, change JOB_URL.
+#     (is_active = true, global — user_id IS NULL) — that's what lets the
+#     site_id-resolution-from-job_url path succeed below without ever calling a
+#     /sites endpoint. If your seed uses a different domain, change JOB_URL.
 #   - jq is installed (`apt install jq` / `brew install jq`) for readable output.
 
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-API_KEY="${API_KEY:-devkey}"
 JOB_URL="https://www.linkedin.com/jobs/view/smoketest-$RANDOM"
 COMPANY="Acme Corp $RANDOM"
 
-AUTH=(-H "Authorization: Bearer ${API_KEY}")
 JSON=(-H "Content-Type: application/json")
+
+# --- Authenticate ----------------------------------------------------------
+AUTH_EMAIL="smoke-applications-$RANDOM$RANDOM@example.com"
+AUTH_PASSWORD="smoke-password-1234"
+AUTH_COOKIES=$(mktemp)
+
+reg_code=$(curl -sS -o /tmp/appl_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/register" \
+  -d "$(jq -n --arg e "$AUTH_EMAIL" --arg p "$AUTH_PASSWORD" '{email: $e, password: $p, display_name: "Smoke Test"}')")
+if [ "$reg_code" != "201" ]; then
+  echo "Could not register a throwaway account (HTTP $reg_code) — cannot authenticate."
+  cat /tmp/appl_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+
+token_code=$(curl -sS -o /tmp/appl_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/tokens" -d '{"name":"smoke test token"}')
+if [ "$token_code" != "201" ]; then
+  echo "Could not issue an API token (HTTP $token_code) — cannot authenticate."
+  cat /tmp/appl_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+API_TOKEN=$(jq -r '.token' /tmp/appl_auth_body)
+rm -f "$AUTH_COOKIES"
+
+AUTH=(-H "Authorization: Bearer ${API_TOKEN}")
 
 pass=0
 fail=0

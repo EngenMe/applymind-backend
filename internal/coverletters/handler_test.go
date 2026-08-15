@@ -15,25 +15,33 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
+// testUserID is the caller every request in this file is authenticated as —
+// see middleware.TestContextWithUserID for why these tests inject it directly
+// rather than running a real RequireAuth in front of the router.
+var testUserID = uuid.New()
+
 type mockService struct {
-	saveText func(ctx context.Context, in SaveTextInput) (*CoverLetter, error)
-	saveFile func(ctx context.Context, in SaveFileInput) (*CoverLetter, error)
-	editText func(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error)
-	get      func(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error)
-	download func(ctx context.Context, applicationID uuid.UUID) (*DownloadLink, error)
+	saveText func(ctx context.Context, userID uuid.UUID, in SaveTextInput) (*CoverLetter, error)
+	saveFile func(ctx context.Context, userID uuid.UUID, in SaveFileInput) (*CoverLetter, error)
+	editText func(ctx context.Context, userID, applicationID uuid.UUID, body string) (*CoverLetter, error)
+	get      func(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error)
+	download func(ctx context.Context, userID, applicationID uuid.UUID) (*DownloadLink, error)
 
 	lastTextInput SaveTextInput
 	lastFileInput SaveFileInput
 	lastEditID    uuid.UUID
 	lastEditBody  string
+	lastUser      uuid.UUID
 }
 
-func (m *mockService) SaveText(ctx context.Context, in SaveTextInput) (*CoverLetter, error) {
-	m.lastTextInput = in
+func (m *mockService) SaveText(ctx context.Context, userID uuid.UUID, in SaveTextInput) (*CoverLetter, error) {
+	m.lastTextInput, m.lastUser = in, userID
 	if m.saveText != nil {
-		return m.saveText(ctx, in)
+		return m.saveText(ctx, userID, in)
 	}
 	body := in.BodyText
 	return &CoverLetter{
@@ -44,10 +52,10 @@ func (m *mockService) SaveText(ctx context.Context, in SaveTextInput) (*CoverLet
 	}, nil
 }
 
-func (m *mockService) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLetter, error) {
-	m.lastFileInput = in
+func (m *mockService) SaveFile(ctx context.Context, userID uuid.UUID, in SaveFileInput) (*CoverLetter, error) {
+	m.lastFileInput, m.lastUser = in, userID
 	if m.saveFile != nil {
-		return m.saveFile(ctx, in)
+		return m.saveFile(ctx, userID, in)
 	}
 	name := in.Filename
 	key := "cover-letters/x/y/" + name
@@ -60,24 +68,29 @@ func (m *mockService) SaveFile(ctx context.Context, in SaveFileInput) (*CoverLet
 	}, nil
 }
 
-func (m *mockService) EditText(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error) {
-	m.lastEditID, m.lastEditBody = applicationID, body
+func (m *mockService) EditText(ctx context.Context, userID, applicationID uuid.UUID, body string) (
+	*CoverLetter,
+	error,
+) {
+	m.lastEditID, m.lastEditBody, m.lastUser = applicationID, body, userID
 	if m.editText != nil {
-		return m.editText(ctx, applicationID, body)
+		return m.editText(ctx, userID, applicationID, body)
 	}
 	return &CoverLetter{ID: uuid.New(), ApplicationID: applicationID, Kind: KindText, BodyText: &body}, nil
 }
 
-func (m *mockService) Get(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error) {
+func (m *mockService) Get(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error) {
+	m.lastUser = userID
 	if m.get != nil {
-		return m.get(ctx, applicationID)
+		return m.get(ctx, userID, applicationID)
 	}
 	return nil, ErrNotFound
 }
 
-func (m *mockService) DownloadURL(ctx context.Context, applicationID uuid.UUID) (*DownloadLink, error) {
+func (m *mockService) DownloadURL(ctx context.Context, userID, applicationID uuid.UUID) (*DownloadLink, error) {
+	m.lastUser = userID
 	if m.download != nil {
-		return m.download(ctx, applicationID)
+		return m.download(ctx, userID, applicationID)
 	}
 	return &DownloadLink{URL: "https://s3.example/x", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
@@ -92,6 +105,7 @@ func newTestServer(svc Service) chi.Router {
 
 func do(t *testing.T, r chi.Router, req *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	req = req.WithContext(middleware.TestContextWithUserID(req.Context(), testUserID))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -161,6 +175,9 @@ func TestHandlerSave_JSONBodyIsSavedAsText(t *testing.T) {
 	if svc.lastTextInput.BodyText != "Dear hiring manager," {
 		t.Errorf("body_text = %q", svc.lastTextInput.BodyText)
 	}
+	if svc.lastUser != testUserID {
+		t.Errorf("userID passed to service = %s, want %s", svc.lastUser, testUserID)
+	}
 	got := decode[coverLetterResponse](t, rec)
 	if got.Kind != "text" {
 		t.Errorf("kind = %q, want text", got.Kind)
@@ -201,7 +218,7 @@ func TestHandlerSave_MultipartIsSavedAsFile(t *testing.T) {
 }
 
 func TestHandlerSave_UnsupportedFileTypeIs415(t *testing.T) {
-	svc := &mockService{saveFile: func(context.Context, SaveFileInput) (*CoverLetter, error) {
+	svc := &mockService{saveFile: func(context.Context, uuid.UUID, SaveFileInput) (*CoverLetter, error) {
 		return nil, ErrUnsupportedFileType
 	}}
 	mux := newTestServer(svc)
@@ -232,7 +249,7 @@ func TestHandlerSave_InvalidJSONIs400(t *testing.T) {
 }
 
 func TestHandlerSave_BlankBodyIs400(t *testing.T) {
-	svc := &mockService{saveText: func(context.Context, SaveTextInput) (*CoverLetter, error) {
+	svc := &mockService{saveText: func(context.Context, uuid.UUID, SaveTextInput) (*CoverLetter, error) {
 		return nil, ErrEmptyBody
 	}}
 	mux := newTestServer(svc)
@@ -251,7 +268,7 @@ func TestHandlerSave_BadApplicationIDIs400(t *testing.T) {
 }
 
 func TestHandlerSave_UnknownApplicationIs404(t *testing.T) {
-	svc := &mockService{saveText: func(context.Context, SaveTextInput) (*CoverLetter, error) {
+	svc := &mockService{saveText: func(context.Context, uuid.UUID, SaveTextInput) (*CoverLetter, error) {
 		return nil, ErrApplicationNotFound
 	}}
 	mux := newTestServer(svc)
@@ -265,7 +282,7 @@ func TestHandlerSave_UnknownApplicationIs404(t *testing.T) {
 }
 
 func TestHandlerSave_ServiceFailureIs500(t *testing.T) {
-	svc := &mockService{saveText: func(context.Context, SaveTextInput) (*CoverLetter, error) {
+	svc := &mockService{saveText: func(context.Context, uuid.UUID, SaveTextInput) (*CoverLetter, error) {
 		return nil, errors.New("neon is down")
 	}}
 	mux := newTestServer(svc)
@@ -286,7 +303,7 @@ func TestHandlerGet_SerialisesBothKinds(t *testing.T) {
 	appID := uuid.New()
 
 	t.Run("text", func(t *testing.T) {
-		svc := &mockService{get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		svc := &mockService{get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			body := "Dear hiring manager,"
 			return &CoverLetter{ID: uuid.New(), ApplicationID: appID, Kind: KindText, BodyText: &body}, nil
 		}}
@@ -304,7 +321,7 @@ func TestHandlerGet_SerialisesBothKinds(t *testing.T) {
 	})
 
 	t.Run("file", func(t *testing.T) {
-		svc := &mockService{get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		svc := &mockService{get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			key, name := "cover-letters/a/b/letter.docx", "letter.docx"
 			return &CoverLetter{
 				ID: uuid.New(), ApplicationID: appID, Kind: KindFile,
@@ -370,7 +387,7 @@ func TestHandlerEditText_Success(t *testing.T) {
 }
 
 func TestHandlerEditText_FileKindIs409(t *testing.T) {
-	svc := &mockService{editText: func(context.Context, uuid.UUID, string) (*CoverLetter, error) {
+	svc := &mockService{editText: func(context.Context, uuid.UUID, uuid.UUID, string) (*CoverLetter, error) {
 		return nil, ErrNotTextKind
 	}}
 	mux := newTestServer(svc)
@@ -385,7 +402,7 @@ func TestHandlerEditText_FileKindIs409(t *testing.T) {
 }
 
 func TestHandlerEditText_MissingCoverLetterIs404(t *testing.T) {
-	svc := &mockService{editText: func(context.Context, uuid.UUID, string) (*CoverLetter, error) {
+	svc := &mockService{editText: func(context.Context, uuid.UUID, uuid.UUID, string) (*CoverLetter, error) {
 		return nil, ErrNotFound
 	}}
 	mux := newTestServer(svc)
@@ -404,7 +421,7 @@ func TestHandlerDownload_ReturnsPresignedURL(t *testing.T) {
 	expires := time.Now().Add(15 * time.Minute).UTC().Truncate(time.Second)
 	var gotApp uuid.UUID
 
-	svc := &mockService{download: func(_ context.Context, id uuid.UUID) (*DownloadLink, error) {
+	svc := &mockService{download: func(_ context.Context, _ uuid.UUID, id uuid.UUID) (*DownloadLink, error) {
 		gotApp = id
 		return &DownloadLink{URL: "https://s3.example/signed", Filename: "letter.pdf", ExpiresAt: expires}, nil
 	}}
@@ -427,7 +444,7 @@ func TestHandlerDownload_ReturnsPresignedURL(t *testing.T) {
 }
 
 func TestHandlerDownload_TextKindIs409(t *testing.T) {
-	svc := &mockService{download: func(context.Context, uuid.UUID) (*DownloadLink, error) {
+	svc := &mockService{download: func(context.Context, uuid.UUID, uuid.UUID) (*DownloadLink, error) {
 		return nil, ErrNotFileKind
 	}}
 	mux := newTestServer(svc)
@@ -442,7 +459,7 @@ func TestHandlerDownload_TextKindIs409(t *testing.T) {
 }
 
 func TestHandlerDownload_NoCoverLetterIs404(t *testing.T) {
-	svc := &mockService{download: func(context.Context, uuid.UUID) (*DownloadLink, error) {
+	svc := &mockService{download: func(context.Context, uuid.UUID, uuid.UUID) (*DownloadLink, error) {
 		return nil, ErrNotFound
 	}}
 	mux := newTestServer(svc)

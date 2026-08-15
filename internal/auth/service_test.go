@@ -386,6 +386,70 @@ func TestRegister_PasswordLengthBoundary(t *testing.T) {
 	}
 }
 
+// bcrypt reads 72 bytes and ignores the rest. Rejecting rather than truncating
+// means two passphrases sharing a 72-byte prefix are never the same credential.
+func TestRegister_PasswordAboveBcryptsCeilingIsRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		password string
+		wantErr  error
+	}{
+		{"exactly the maximum", strings.Repeat("a", MaxPasswordLength), nil},
+		{"one over", strings.Repeat("a", MaxPasswordLength+1), ErrPasswordTooLong},
+		// Bytes, not runes: 40 three-byte characters is 120 bytes, which bcrypt
+		// will not read past even though it is well under 72 characters.
+		{"multibyte under 72 runes but over 72 bytes", strings.Repeat("パ", 40), ErrPasswordTooLong},
+	}
+
+	for _, tc := range cases {
+		t.Run(
+			tc.name, func(t *testing.T) {
+				svc, _, _ := newTestService(t)
+				_, err := svc.Register(
+					context.Background(),
+					RegisterInput{Email: "someone@example.com", Password: tc.password},
+				)
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tc.wantErr)
+				}
+			},
+		)
+	}
+}
+
+// mail.ParseAddress accepts a full mailbox, so the display name has to be
+// dropped rather than stored as part of the address.
+func TestRegister_MailboxFormStoresOnlyTheAddress(t *testing.T) {
+	svc, repo, _ := newTestService(t)
+
+	result, err := svc.Register(
+		context.Background(),
+		RegisterInput{Email: "Farouk <Someone@Example.com>", Password: testPassword},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if stored := repo.users[result.User.ID].Email; stored != "someone@example.com" {
+		t.Errorf("stored email = %q, want the parsed address with the display name dropped", stored)
+	}
+}
+
+// The address is what identifies an account, so the mailbox form of an existing
+// address must collide with it rather than opening a second account.
+func TestRegister_MailboxFormCollidesWithThePlainAddress(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	mustRegister(t, svc, "someone@example.com")
+
+	_, err := svc.Register(
+		context.Background(),
+		RegisterInput{Email: "Someone Else <someone@example.com>", Password: testPassword},
+	)
+	if !errors.Is(err, ErrEmailTaken) {
+		t.Fatalf("error = %v, want ErrEmailTaken", err)
+	}
+}
+
 // No composition rules: length is the whole requirement.
 func TestRegister_LongAllLowercasePasswordIsAccepted(t *testing.T) {
 	svc, _, _ := newTestService(t)
@@ -477,7 +541,7 @@ func TestLogin_WrongPasswordAndUnknownEmailAreIndistinguishable(t *testing.T) {
 }
 
 // dummyHash has to be a well-formed bcrypt hash at the production cost, or the
-// comparison against it returns instantly and the timing equalisation it exists
+// comparison against it returns instantly, and the timing equalisation it exists
 // for silently stops working.
 func TestDummyHashIsUsableAtProductionCost(t *testing.T) {
 	cost, err := bcrypt.Cost(dummyHash)

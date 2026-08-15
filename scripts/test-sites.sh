@@ -2,27 +2,57 @@
 # Manual smoke test for the `sites` module over curl.
 #
 # Usage:
-#   BASE_URL=http://localhost:8080 API_KEY=devkey123 ./test-sites.sh
+#   BASE_URL=http://localhost:8080 ./test-sites.sh
 #
 # Assumptions — adjust if your setup differs:
-#   - Auth header is `Authorization: Bearer <API_KEY>`, same as
-#     test-applications.sh.
+#   - Phase 15 removed the shared static API key; every route now requires a
+#     real user. This script registers a throwaway account, issues it a bearer
+#     API token the same way the extension would, and uses that token for
+#     everything below. The account is left behind — see test-auth.sh's header
+#     comment for the cleanup query.
 #   - cmd/api/main.go calls sites.Service.SeedPreconfigured at startup, so by
-#     the time this script runs the eleven pre-configured sites already exist,
-#     LinkedIn active and the rest inactive. If you haven't wired that call in
-#     yet, steps 1-3 will still pass against whatever migration 000010 alone
-#     seeded (LinkedIn only) — steps 4 onward do not depend on the full list.
+#     the time this script runs the eleven pre-configured (global, user_id
+#     IS NULL) sites already exist, LinkedIn active and the rest inactive. If
+#     you haven't wired that call in yet, steps 1-3 will still pass against
+#     whatever migration 000010 alone seeded (LinkedIn only) — steps 4 onward
+#     do not depend on the full list.
 #   - jq is installed (`apt install jq` / `brew install jq`) for readable output.
 
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-API_KEY="${API_KEY:-devkey}"
 CUSTOM_NAME="Smoketest Boards $RANDOM"
 CUSTOM_DOMAIN="smoketest-$RANDOM.example.com"
 
-AUTH=(-H "Authorization: Bearer ${API_KEY}")
 JSON=(-H "Content-Type: application/json")
+
+# --- Authenticate ----------------------------------------------------------
+AUTH_EMAIL="smoke-sites-$RANDOM$RANDOM@example.com"
+AUTH_PASSWORD="smoke-password-1234"
+AUTH_COOKIES=$(mktemp)
+
+reg_code=$(curl -sS -o /tmp/sites_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/register" \
+  -d "$(jq -n --arg e "$AUTH_EMAIL" --arg p "$AUTH_PASSWORD" '{email: $e, password: $p, display_name: "Smoke Test"}')")
+if [ "$reg_code" != "201" ]; then
+  echo "Could not register a throwaway account (HTTP $reg_code) — cannot authenticate."
+  cat /tmp/sites_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+
+token_code=$(curl -sS -o /tmp/sites_auth_body -w "%{http_code}" -c "$AUTH_COOKIES" -b "$AUTH_COOKIES" \
+  "${JSON[@]}" -X POST "${BASE_URL}/auth/tokens" -d '{"name":"smoke test token"}')
+if [ "$token_code" != "201" ]; then
+  echo "Could not issue an API token (HTTP $token_code) — cannot authenticate."
+  cat /tmp/sites_auth_body
+  rm -f "$AUTH_COOKIES"
+  exit 1
+fi
+API_TOKEN=$(jq -r '.token' /tmp/sites_auth_body)
+rm -f "$AUTH_COOKIES"
+
+AUTH=(-H "Authorization: Bearer ${API_TOKEN}")
 
 pass=0
 fail=0

@@ -15,7 +15,6 @@ import (
 // Config holds all runtime configuration for the API and scheduler Lambdas.
 type Config struct {
 	NeonDatabaseURL string
-	APIKey          string
 	Port            string
 
 	// CVBucket is the S3 bucket the cvs module stores uploaded files in.
@@ -71,7 +70,6 @@ func (c *Config) AIScoringEnabled() bool {
 func Load() (*Config, error) {
 	cfg := &Config{
 		NeonDatabaseURL: os.Getenv("NEON_DATABASE_URL"),
-		APIKey:          os.Getenv("APPLYMIND_API_KEY"),
 		Port:            os.Getenv("PORT"),
 		CVBucket:        os.Getenv("APPLYMIND_CV_BUCKET"),
 		OpenAIAPIKey:    strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
@@ -81,9 +79,6 @@ func Load() (*Config, error) {
 	var missing []string
 	if cfg.NeonDatabaseURL == "" {
 		missing = append(missing, "NEON_DATABASE_URL")
-	}
-	if cfg.APIKey == "" {
-		missing = append(missing, "APPLYMIND_API_KEY")
 	}
 	if cfg.CVBucket == "" {
 		missing = append(missing, "APPLYMIND_CV_BUCKET")

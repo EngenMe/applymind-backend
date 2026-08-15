@@ -1,0 +1,2 @@
+ALTER TABLE cvs DROP CONSTRAINT IF EXISTS uq_cvs_user_name;
+ALTER TABLE cvs ADD CONSTRAINT cvs_name_key UNIQUE (name);

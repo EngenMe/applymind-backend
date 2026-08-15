@@ -20,6 +20,10 @@ import (
 // nothing to do, which is the normal outcome of seeding a table that has already
 // been seeded.
 //
+// Phase 15: every read takes a userID and matches a global row (user_id IS
+// NULL — the pre-configured list) or one this user owns. Ensure is unaffected:
+// it only ever writes global rows, at boot, before any request exists.
+//
 // There is no Tx method: every operation here writes at most one row, so this
 // module never needs a transaction of its own and NewRepository takes only the
 // Queries, like cvs and coverletters.
@@ -29,15 +33,17 @@ type Repository interface {
 	// and returns (nil, nil) when it was already there. Idempotent, so seeding
 	// can run on every boot without a first-run flag.
 	Ensure(ctx context.Context, in NewSite) (*Site, error)
-	List(ctx context.Context, f ListFilter) ([]Site, error)
-	Get(ctx context.Context, id uuid.UUID) (*Site, error)
-	// GetByDomain looks up an already-normalised host. It ignores is_active: an
-	// inactive site still exists, and the caller decides whether that matters.
-	GetByDomain(ctx context.Context, domain string) (*Site, error)
-	SetActive(ctx context.Context, id uuid.UUID, active bool) (*Site, error)
-	// Delete removes a site. It returns ErrInUse when applications still
-	// reference it — the foreign key is ON DELETE RESTRICT per the ERD.
-	Delete(ctx context.Context, id uuid.UUID) error
+	List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Site, error)
+	Get(ctx context.Context, userID, id uuid.UUID) (*Site, error)
+	// GetByDomain looks up an already-normalised host, global or this user's
+	// own. It ignores is_active: an inactive site still exists, and the caller
+	// decides whether that matters.
+	GetByDomain(ctx context.Context, userID uuid.UUID, domain string) (*Site, error)
+	SetActive(ctx context.Context, userID, id uuid.UUID, active bool) (*Site, error)
+	// Delete removes a site owned by userID. It returns ErrInUse when
+	// applications still reference it — the foreign key is ON DELETE RESTRICT
+	// per the ERD.
+	Delete(ctx context.Context, userID, id uuid.UUID) error
 }
 
 // postgresRepository is the sqlc-backed implementation.
@@ -55,6 +61,7 @@ func NewRepository(q *sqlcdb.Queries) Repository {
 func (r *postgresRepository) Create(ctx context.Context, in NewSite) (*Site, error) {
 	row, err := r.q.CreateSite(
 		ctx, sqlcdb.CreateSiteParams{
+			UserID:          in.UserID,
 			Name:            in.Name,
 			Domain:          in.Domain,
 			IsPreconfigured: in.IsPreconfigured,
@@ -95,24 +102,24 @@ func (r *postgresRepository) Ensure(ctx context.Context, in NewSite) (*Site, err
 	return &site, nil
 }
 
-func (r *postgresRepository) List(ctx context.Context, f ListFilter) ([]Site, error) {
+func (r *postgresRepository) List(ctx context.Context, userID uuid.UUID, f ListFilter) ([]Site, error) {
 	if f.ActiveOnly {
-		rows, err := r.q.ListActiveSites(ctx)
+		rows, err := r.q.ListActiveSites(ctx, userID)
 		if err != nil {
 			return nil, err
 		}
 		return toDomainSlice(rows), nil
 	}
 
-	rows, err := r.q.ListSites(ctx)
+	rows, err := r.q.ListSites(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	return toDomainSlice(rows), nil
 }
 
-func (r *postgresRepository) Get(ctx context.Context, id uuid.UUID) (*Site, error) {
-	row, err := r.q.GetSite(ctx, id)
+func (r *postgresRepository) Get(ctx context.Context, userID, id uuid.UUID) (*Site, error) {
+	row, err := r.q.GetSite(ctx, sqlcdb.GetSiteParams{ID: id, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -123,8 +130,8 @@ func (r *postgresRepository) Get(ctx context.Context, id uuid.UUID) (*Site, erro
 	return &site, nil
 }
 
-func (r *postgresRepository) GetByDomain(ctx context.Context, domain string) (*Site, error) {
-	row, err := r.q.GetSiteByDomain(ctx, domain)
+func (r *postgresRepository) GetByDomain(ctx context.Context, userID uuid.UUID, domain string) (*Site, error) {
+	row, err := r.q.GetSiteByDomain(ctx, sqlcdb.GetSiteByDomainParams{Domain: domain, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -135,11 +142,12 @@ func (r *postgresRepository) GetByDomain(ctx context.Context, domain string) (*S
 	return &site, nil
 }
 
-func (r *postgresRepository) SetActive(ctx context.Context, id uuid.UUID, active bool) (*Site, error) {
+func (r *postgresRepository) SetActive(ctx context.Context, userID, id uuid.UUID, active bool) (*Site, error) {
 	row, err := r.q.SetSiteActive(
 		ctx, sqlcdb.SetSiteActiveParams{
 			ID:       id,
 			IsActive: active,
+			UserID:   userID,
 		},
 	)
 	if err != nil {
@@ -152,8 +160,8 @@ func (r *postgresRepository) SetActive(ctx context.Context, id uuid.UUID, active
 	return &site, nil
 }
 
-func (r *postgresRepository) Delete(ctx context.Context, id uuid.UUID) error {
-	affected, err := r.q.DeleteSite(ctx, id)
+func (r *postgresRepository) Delete(ctx context.Context, userID, id uuid.UUID) error {
+	affected, err := r.q.DeleteSite(ctx, sqlcdb.DeleteSiteParams{ID: id, UserID: userID})
 	if err != nil {
 		return translateWriteError(err)
 	}

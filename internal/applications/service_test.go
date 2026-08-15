@@ -14,6 +14,12 @@ import (
 
 // ---------------------------------------------------------------------------
 // Fakes
+//
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too.
+//
+// CVVersionOwnedByUser and SetAIScore are defined on *fakeRepo in
+// service_scoring_test.go, not here — do not add them again in this file.
 // ---------------------------------------------------------------------------
 
 type reminder struct {
@@ -24,11 +30,18 @@ type reminder struct {
 // fakeRepo is an in-memory Repository. Tx runs fn against the same instance,
 // which is enough to assert what a successful transaction wrote; rollback
 // behaviour belongs to an integration test against a real database.
+//
+// sites and sitesByID are two views of the same rows — the former keyed by
+// domain (FindSiteByDomain), the latter by id (FindSiteByID, added in phase
+// 15 so an explicit site_id can be validated rather than trusted outright).
+// addSite is what keeps them in sync; nothing should write to either map
+// directly.
 type fakeRepo struct {
 	apps      map[uuid.UUID]*Application
 	history   map[uuid.UUID][]StatusHistory
 	reminders map[uuid.UUID][]*reminder
 	sites     map[string]Site
+	sitesByID map[uuid.UUID]Site
 
 	lastFilter ListFilter
 	createErr  error
@@ -41,7 +54,15 @@ func newFakeRepo() *fakeRepo {
 		history:   map[uuid.UUID][]StatusHistory{},
 		reminders: map[uuid.UUID][]*reminder{},
 		sites:     map[string]Site{},
+		sitesByID: map[uuid.UUID]Site{},
 	}
+}
+
+// addSite registers a site under both lookups. Tests that used to write
+// repo.sites[domain] = site directly should call this instead.
+func (f *fakeRepo) addSite(site Site) {
+	f.sites[site.Domain] = site
+	f.sitesByID[site.ID] = site
 }
 
 func (f *fakeRepo) Tx(ctx context.Context, fn func(Repository) error) error {
@@ -71,7 +92,7 @@ func (f *fakeRepo) Create(_ context.Context, in NewApplication) (*Application, e
 	return copyApp(app), nil
 }
 
-func (f *fakeRepo) Get(_ context.Context, id uuid.UUID) (*Application, error) {
+func (f *fakeRepo) Get(_ context.Context, _, id uuid.UUID) (*Application, error) {
 	app, ok := f.apps[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -79,7 +100,7 @@ func (f *fakeRepo) Get(_ context.Context, id uuid.UUID) (*Application, error) {
 	return copyApp(app), nil
 }
 
-func (f *fakeRepo) List(_ context.Context, filter ListFilter) ([]Application, error) {
+func (f *fakeRepo) List(_ context.Context, _ uuid.UUID, filter ListFilter) ([]Application, error) {
 	f.lastFilter = filter
 
 	out := []Application{}
@@ -117,7 +138,7 @@ func (f *fakeRepo) List(_ context.Context, filter ListFilter) ([]Application, er
 	return out, nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, in UpdateFields) (*Application, error) {
+func (f *fakeRepo) Update(_ context.Context, _, id uuid.UUID, in UpdateFields) (*Application, error) {
 	app, ok := f.apps[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -133,7 +154,7 @@ func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, in UpdateFields) (*Ap
 
 func (f *fakeRepo) UpdateStatus(
 	_ context.Context,
-	id uuid.UUID,
+	_, id uuid.UUID,
 	status Status,
 	appliedAt *time.Time,
 ) (*Application, error) {
@@ -148,7 +169,7 @@ func (f *fakeRepo) UpdateStatus(
 	return copyApp(app), nil
 }
 
-func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
+func (f *fakeRepo) Delete(_ context.Context, _, id uuid.UUID) error {
 	if _, ok := f.apps[id]; !ok {
 		return ErrNotFound
 	}
@@ -158,7 +179,7 @@ func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (f *fakeRepo) FindByCompanyName(_ context.Context, company string) ([]Application, error) {
+func (f *fakeRepo) FindByCompanyName(_ context.Context, _ uuid.UUID, company string) ([]Application, error) {
 	out := []Application{}
 	want := strings.ToLower(strings.TrimSpace(company))
 	for _, app := range f.apps {
@@ -183,11 +204,11 @@ func (f *fakeRepo) CreateStatusHistory(_ context.Context, in NewStatusHistory) (
 	return &entry, nil
 }
 
-func (f *fakeRepo) ListStatusHistory(_ context.Context, applicationID uuid.UUID) ([]StatusHistory, error) {
+func (f *fakeRepo) ListStatusHistory(_ context.Context, _, applicationID uuid.UUID) ([]StatusHistory, error) {
 	return append([]StatusHistory{}, f.history[applicationID]...), nil
 }
 
-func (f *fakeRepo) EnsurePendingReminder(_ context.Context, applicationID uuid.UUID, dueAt time.Time) error {
+func (f *fakeRepo) EnsurePendingReminder(_ context.Context, _, applicationID uuid.UUID, dueAt time.Time) error {
 	for _, r := range f.reminders[applicationID] {
 		if !r.dismissed {
 			return nil // one pending at a time, per the partial unique index
@@ -197,15 +218,27 @@ func (f *fakeRepo) EnsurePendingReminder(_ context.Context, applicationID uuid.U
 	return nil
 }
 
-func (f *fakeRepo) DismissPendingReminders(_ context.Context, applicationID uuid.UUID) error {
+func (f *fakeRepo) DismissPendingReminders(_ context.Context, _, applicationID uuid.UUID) error {
 	for _, r := range f.reminders[applicationID] {
 		r.dismissed = true
 	}
 	return nil
 }
 
-func (f *fakeRepo) FindSiteByDomain(_ context.Context, domain string) (*Site, error) {
+func (f *fakeRepo) FindSiteByDomain(_ context.Context, _ uuid.UUID, domain string) (*Site, error) {
 	site, ok := f.sites[domain]
+	if !ok {
+		return nil, nil
+	}
+	return &site, nil
+}
+
+// FindSiteByID backs resolveSiteID's validation of an explicit site_id, added
+// in phase 15: unlike the pre-15 code, an explicit site_id is no longer
+// trusted outright — it has to actually be a registered site. (nil, nil)
+// means "not found", which service.resolveSiteID turns into ErrSiteNotFound.
+func (f *fakeRepo) FindSiteByID(_ context.Context, _, id uuid.UUID) (*Site, error) {
+	site, ok := f.sitesByID[id]
 	if !ok {
 		return nil, nil
 	}
@@ -226,7 +259,7 @@ type fakeCoverLetters struct {
 	err   error
 }
 
-func (f *fakeCoverLetters) SaveText(_ context.Context, in coverletters.SaveTextInput) (
+func (f *fakeCoverLetters) SaveText(_ context.Context, _ uuid.UUID, in coverletters.SaveTextInput) (
 	*coverletters.CoverLetter,
 	error,
 ) {
@@ -268,7 +301,7 @@ func newTestService(t *testing.T) (*fakeRepo, *fakeCoverLetters, Service) {
 	t.Helper()
 
 	repo := newFakeRepo()
-	repo.sites[linkedIn.Domain] = linkedIn
+	repo.addSite(linkedIn)
 	cl := &fakeCoverLetters{}
 
 	svc := NewService(
@@ -300,7 +333,7 @@ func TestCreateSuccess(t *testing.T) {
 	body := "Dear hiring manager..."
 	in.CoverLetterText = &body
 
-	result, err := svc.Create(context.Background(), in)
+	result, err := svc.Create(context.Background(), testUserID, in)
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -333,7 +366,7 @@ func TestCreateSuccess(t *testing.T) {
 func TestCreateWritesFirstHistoryRow(t *testing.T) {
 	repo, _, svc := newTestService(t)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -366,7 +399,7 @@ func TestCreateReturnsDuplicateWarningWithoutBlocking(t *testing.T) {
 		CreatedAt:   fixedNow,
 	}
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: a duplicate must not block the save, got error: %v", err)
 	}
@@ -384,7 +417,7 @@ func TestCreateReturnsDuplicateWarningWithoutBlocking(t *testing.T) {
 func TestCreateSchedulesFollowUp(t *testing.T) {
 	repo, _, svc := newTestService(t)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -408,7 +441,7 @@ func TestCreateSavedStatusSchedulesNothing(t *testing.T) {
 	in := validInput()
 	in.Status = StatusSaved
 
-	result, err := svc.Create(context.Background(), in)
+	result, err := svc.Create(context.Background(), testUserID, in)
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -444,7 +477,7 @@ func TestCreateValidation(t *testing.T) {
 				in := validInput()
 				tc.mutate(&in)
 
-				if _, err := svc.Create(context.Background(), in); !errors.Is(err, tc.want) {
+				if _, err := svc.Create(context.Background(), testUserID, in); !errors.Is(err, tc.want) {
 					t.Errorf("error = %v, want %v", err, tc.want)
 				}
 			},
@@ -452,19 +485,44 @@ func TestCreateValidation(t *testing.T) {
 	}
 }
 
+// Phase 15: an explicit site_id is validated against FindSiteByID rather than
+// trusted outright, so "wins" now means "wins once it is a real, registered
+// site" — the fixture registers it first, which is the whole point of the
+// check this test exercises.
 func TestCreateExplicitSiteIDWins(t *testing.T) {
-	_, _, svc := newTestService(t)
+	repo, _, svc := newTestService(t)
 
-	other := uuid.MustParse("55555555-5555-5555-5555-555555555555")
+	other := Site{
+		ID:     uuid.MustParse("55555555-5555-5555-5555-555555555555"),
+		Name:   "Greenhouse",
+		Domain: "greenhouse.io",
+	}
+	repo.addSite(other)
+
 	in := validInput()
-	in.SiteID = &other
+	in.SiteID = &other.ID
 
-	result, err := svc.Create(context.Background(), in)
+	result, err := svc.Create(context.Background(), testUserID, in)
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
-	if result.Application.SiteID != other {
-		t.Errorf("site id = %v, want the explicitly supplied %v", result.Application.SiteID, other)
+	if result.Application.SiteID != other.ID {
+		t.Errorf("site id = %v, want the explicitly supplied %v", result.Application.SiteID, other.ID)
+	}
+}
+
+// An explicit site_id that is not a real, registered site must be rejected —
+// this is the phase 15 fix TestCreateExplicitSiteIDWins's fixture works around
+// by registering the site first. This test asserts the rejection itself.
+func TestCreateExplicitSiteIDMustBeRegistered(t *testing.T) {
+	_, _, svc := newTestService(t)
+
+	unregistered := uuid.MustParse("66666666-6666-6666-6666-666666666666")
+	in := validInput()
+	in.SiteID = &unregistered
+
+	if _, err := svc.Create(context.Background(), testUserID, in); !errors.Is(err, ErrSiteNotFound) {
+		t.Errorf("error = %v, want %v for a site_id nobody registered", err, ErrSiteNotFound)
 	}
 }
 
@@ -476,7 +534,7 @@ func TestCreateRollsBackWhenCoverLetterFails(t *testing.T) {
 	body := "Dear hiring manager..."
 	in.CoverLetterText = &body
 
-	if _, err := svc.Create(context.Background(), in); err == nil {
+	if _, err := svc.Create(context.Background(), testUserID, in); err == nil {
 		t.Fatal("Create: want an error when the cover letter cannot be saved")
 	}
 	if len(repo.apps) != 0 {
@@ -490,7 +548,7 @@ func TestCreateRollsBackWhenCoverLetterFails(t *testing.T) {
 
 func createFixture(t *testing.T, svc Service) *Application {
 	t.Helper()
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create fixture: %v", err)
 	}
@@ -503,7 +561,7 @@ func TestUpdateStatusWritesHistory(t *testing.T) {
 
 	note := "recruiter emailed"
 	updated, err := svc.UpdateStatus(
-		context.Background(), app.ID,
+		context.Background(), testUserID, app.ID,
 		StatusUpdateInput{Status: StatusInterviewing, Note: &note},
 	)
 	if err != nil {
@@ -541,7 +599,7 @@ func TestUpdateStatusDismissesPendingReminder(t *testing.T) {
 	}
 
 	if _, err := svc.UpdateStatus(
-		context.Background(), app.ID,
+		context.Background(), testUserID, app.ID,
 		StatusUpdateInput{Status: StatusAcknowledged},
 	); err != nil {
 		t.Fatalf("UpdateStatus: unexpected error: %v", err)
@@ -557,13 +615,15 @@ func TestUpdateStatusToAppliedStampsAndSchedules(t *testing.T) {
 
 	in := validInput()
 	in.Status = StatusSaved
-	result, err := svc.Create(context.Background(), in)
+	result, err := svc.Create(context.Background(), testUserID, in)
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
 	app := result.Application
 
-	updated, err := svc.UpdateStatus(context.Background(), app.ID, StatusUpdateInput{Status: StatusApplied})
+	updated, err := svc.UpdateStatus(
+		context.Background(), testUserID, app.ID, StatusUpdateInput{Status: StatusApplied},
+	)
 	if err != nil {
 		t.Fatalf("UpdateStatus: unexpected error: %v", err)
 	}
@@ -585,21 +645,21 @@ func TestUpdateStatusRejectsNoOpAndUnknownValues(t *testing.T) {
 	app := createFixture(t, svc)
 
 	if _, err := svc.UpdateStatus(
-		context.Background(), app.ID,
+		context.Background(), testUserID, app.ID,
 		StatusUpdateInput{Status: StatusApplied},
 	); !errors.Is(err, ErrSameStatus) {
 		t.Errorf("error = %v, want %v for a transition that changes nothing", err, ErrSameStatus)
 	}
 
 	if _, err := svc.UpdateStatus(
-		context.Background(), app.ID,
+		context.Background(), testUserID, app.ID,
 		StatusUpdateInput{Status: "Ghosted"},
 	); !errors.Is(err, ErrInvalidStatus) {
 		t.Errorf("error = %v, want %v", err, ErrInvalidStatus)
 	}
 
 	if _, err := svc.UpdateStatus(
-		context.Background(), app.ID,
+		context.Background(), testUserID, app.ID,
 		StatusUpdateInput{Status: StatusGhost, ChangedBy: "cron"},
 	); !errors.Is(err, ErrInvalidChangeSource) {
 		t.Errorf("error = %v, want %v", err, ErrInvalidChangeSource)
@@ -609,7 +669,9 @@ func TestUpdateStatusRejectsNoOpAndUnknownValues(t *testing.T) {
 func TestUpdateStatusUnknownApplication(t *testing.T) {
 	_, _, svc := newTestService(t)
 
-	_, err := svc.UpdateStatus(context.Background(), uuid.New(), StatusUpdateInput{Status: StatusRejected})
+	_, err := svc.UpdateStatus(
+		context.Background(), testUserID, uuid.New(), StatusUpdateInput{Status: StatusRejected},
+	)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("error = %v, want %v", err, ErrNotFound)
 	}
@@ -634,7 +696,7 @@ func TestFollowUpDueAt(t *testing.T) {
 
 func TestCreateHonoursConfiguredFollowUpDelay(t *testing.T) {
 	repo := newFakeRepo()
-	repo.sites[linkedIn.Domain] = linkedIn
+	repo.addSite(linkedIn)
 	svc := NewService(
 		repo, &fakeCoverLetters{},
 		WithClock(func() time.Time { return fixedNow }),
@@ -642,7 +704,7 @@ func TestCreateHonoursConfiguredFollowUpDelay(t *testing.T) {
 		WithFollowUpDelay(3*24*time.Hour),
 	)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -715,7 +777,7 @@ func TestListFilterCombinations(t *testing.T) {
 				repo, _, svc := newTestService(t)
 				seedForListing(repo)
 
-				got, err := svc.List(context.Background(), tc.filter)
+				got, err := svc.List(context.Background(), testUserID, tc.filter)
 				if err != nil {
 					t.Fatalf("List: unexpected error: %v", err)
 				}
@@ -730,7 +792,7 @@ func TestListFilterCombinations(t *testing.T) {
 func TestListClampsPaging(t *testing.T) {
 	repo, _, svc := newTestService(t)
 
-	if _, err := svc.List(context.Background(), ListFilter{Limit: 0, Offset: -5}); err != nil {
+	if _, err := svc.List(context.Background(), testUserID, ListFilter{Limit: 0, Offset: -5}); err != nil {
 		t.Fatalf("List: unexpected error: %v", err)
 	}
 	if repo.lastFilter.Limit != DefaultListLimit {
@@ -740,7 +802,7 @@ func TestListClampsPaging(t *testing.T) {
 		t.Errorf("offset = %d, want a negative offset clamped to 0", repo.lastFilter.Offset)
 	}
 
-	if _, err := svc.List(context.Background(), ListFilter{Limit: 5000}); err != nil {
+	if _, err := svc.List(context.Background(), testUserID, ListFilter{Limit: 5000}); err != nil {
 		t.Fatalf("List: unexpected error: %v", err)
 	}
 	if repo.lastFilter.Limit != MaxListLimit {
@@ -752,7 +814,9 @@ func TestListRejectsUnknownStatus(t *testing.T) {
 	_, _, svc := newTestService(t)
 
 	unknown := Status("Interviewd")
-	if _, err := svc.List(context.Background(), ListFilter{Status: &unknown}); !errors.Is(err, ErrInvalidStatus) {
+	if _, err := svc.List(
+		context.Background(), testUserID, ListFilter{Status: &unknown},
+	); !errors.Is(err, ErrInvalidStatus) {
 		t.Errorf("error = %v, want %v", err, ErrInvalidStatus)
 	}
 }
@@ -761,7 +825,9 @@ func TestListDropsBlankFilters(t *testing.T) {
 	repo, _, svc := newTestService(t)
 
 	blank := "   "
-	if _, err := svc.List(context.Background(), ListFilter{Company: &blank, Search: &blank}); err != nil {
+	if _, err := svc.List(
+		context.Background(), testUserID, ListFilter{Company: &blank, Search: &blank},
+	); err != nil {
 		t.Fatalf("List: unexpected error: %v", err)
 	}
 	if repo.lastFilter.Company != nil || repo.lastFilter.Search != nil {
@@ -780,7 +846,7 @@ func TestCheckDuplicate(t *testing.T) {
 	repo, _, svc := newTestService(t)
 	seedForListing(repo)
 
-	warning, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: "  stripe  "})
+	warning, err := svc.CheckDuplicate(context.Background(), testUserID, DuplicateQuery{Company: "  stripe  "})
 	if err != nil {
 		t.Fatalf("CheckDuplicate: unexpected error: %v", err)
 	}
@@ -788,7 +854,7 @@ func TestCheckDuplicate(t *testing.T) {
 		t.Fatalf("warning = %+v, want 2 matches ignoring case and whitespace", warning)
 	}
 
-	none, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: "Vercel"})
+	none, err := svc.CheckDuplicate(context.Background(), testUserID, DuplicateQuery{Company: "Vercel"})
 	if err != nil {
 		t.Fatalf("CheckDuplicate: unexpected error: %v", err)
 	}
@@ -796,10 +862,9 @@ func TestCheckDuplicate(t *testing.T) {
 		t.Errorf("warning = %+v, want nil for a company never applied to", none)
 	}
 
-	if _, err := svc.CheckDuplicate(context.Background(), DuplicateQuery{Company: " "}); !errors.Is(
-		err,
-		ErrCompanyRequired,
-	) {
+	if _, err := svc.CheckDuplicate(
+		context.Background(), testUserID, DuplicateQuery{Company: " "},
+	); !errors.Is(err, ErrCompanyRequired) {
 		t.Errorf("error = %v, want %v", err, ErrCompanyRequired)
 	}
 }
@@ -808,7 +873,7 @@ func TestGetLoadsHistory(t *testing.T) {
 	_, _, svc := newTestService(t)
 	app := createFixture(t, svc)
 
-	got, err := svc.Get(context.Background(), app.ID)
+	got, err := svc.Get(context.Background(), testUserID, app.ID)
 	if err != nil {
 		t.Fatalf("Get: unexpected error: %v", err)
 	}
@@ -822,7 +887,7 @@ func TestUpdateDoesNotTouchStatus(t *testing.T) {
 	app := createFixture(t, svc)
 
 	updated, err := svc.Update(
-		context.Background(), app.ID, UpdateInput{
+		context.Background(), testUserID, app.ID, UpdateInput{
 			CompanyName:    "Stripe Inc",
 			JobTitle:       "Staff Backend Engineer",
 			JobDescription: "Updated description",
@@ -846,7 +911,7 @@ func TestUpdateDoesNotTouchStatus(t *testing.T) {
 func TestDeleteUnknownApplication(t *testing.T) {
 	_, _, svc := newTestService(t)
 
-	if err := svc.Delete(context.Background(), uuid.New()); !errors.Is(err, ErrNotFound) {
+	if err := svc.Delete(context.Background(), testUserID, uuid.New()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("error = %v, want %v", err, ErrNotFound)
 	}
 }

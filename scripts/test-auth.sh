@@ -2,20 +2,21 @@
 # Manual smoke test for the `auth` module over curl.
 #
 # Usage:
-#   BASE_URL=http://localhost:8080 API_KEY=devkey123 ./test-auth.sh
+#   BASE_URL=http://localhost:8080 ./test-auth.sh
 #
 # Assumptions — adjust if your setup differs:
-#   - Phase 14 wiring: /auth/register and /auth/login are public, the rest of
-#     /auth/* is behind RequireAuth, and the existing module group (/sites and
-#     friends) is still behind LegacyStaticKeyAuth. Step 24 checks that split
-#     is actually what's mounted.
+#   - Phase 15 wiring: /auth/register and /auth/login are public; everything
+#     else, including the sites/applications/cvs/coverletters/notifications
+#     module group, is behind RequireAuth. The shared static API key from
+#     phase 14 (LegacyStaticKeyAuth) is gone — step 24 checks that a bearer
+#     token now works where the old key used to, and that garbage in the
+#     Authorization header is rejected.
 #   - APPLYMIND_COOKIE_SECURE=false in your local .env. Over plain http a
 #     Secure cookie is stored by curl and then never sent back, so every
 #     cookie-authenticated step would fail for a reason that has nothing to do
 #     with the code. Step 2 detects this and says so rather than letting you
 #     debug fifteen red lines.
 #   - jq is installed (`apt install jq` / `brew install jq`) for readable output.
-#   - API_KEY matches APPLYMIND_API_KEY in your .env — only step 24 needs it.
 #
 # This registers one throwaway account per run (smoke-$RANDOM@example.com) and
 # leaves it behind: there is no delete-account endpoint in this phase. Clean up
@@ -30,7 +31,6 @@
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-API_KEY="${API_KEY:-devkey}"
 
 EMAIL="smoke-$RANDOM$RANDOM@example.com"
 PASSWORD="smoke-password-1234"
@@ -101,7 +101,7 @@ as_none()    { AUTH_ARGS=(); }
 as_cookie()  { AUTH_ARGS=(-b "$JAR" -c "$JAR"); }
 as_cookie2() { AUTH_ARGS=(-b "$JAR2" -c "$JAR2"); }
 as_bearer()  { AUTH_ARGS=(-H "Authorization: Bearer $1"); }
-as_apikey()  { AUTH_ARGS=(-H "Authorization: Bearer $API_KEY"); }
+as_garbage() { AUTH_ARGS=(-H "Authorization: Bearer this-is-not-a-real-credential"); }
 
 echo "== 0. health check (unauthenticated) =="
 as_none
@@ -356,15 +356,16 @@ req POST /auth/logout
 check 204 "POST /auth/logout (no session behind this credential)"
 echo
 
-echo "== 24. phase 14 split: the module group is still on the static key =="
-as_apikey
+echo "== 24. phase 15: the module group requires a real credential, not the removed static key =="
+as_garbage
 req GET /sites
-check 200 "GET /sites (static API key)"
+check 401 "GET /sites (garbage bearer value — the old static key means nothing now)"
 as_bearer "$FULL_TOKEN"
 req GET /sites
-check 401 "GET /sites (auth token — not accepted until phase 15)"
-echo "  (if this returns 200, the module group has been moved onto RequireAuth"
-echo "   early — those queries still ignore user_id, so that is a data leak)"
+check 200 "GET /sites (real auth token)"
+echo "  (if the garbage credential returns 200, something is accepting requests"
+echo "   without actually validating them; if the real token returns 401, the"
+echo "   module group is still on the old static key)"
 echo
 
 echo "== 25. no credential on a protected route -> 401 =="

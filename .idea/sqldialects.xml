@@ -29,9 +29,8 @@
     <file url="file://$PROJECT_DIR$/migrations/000014_add_user_ownership.up.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/migrations/000015_rescope_unique_constraints.down.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/migrations/000015_rescope_unique_constraints.up.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/queries/applications.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/queries/cover_letters.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/queries/notifications.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000017_rescope_cvs_name_unique.down.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/000017_rescope_cvs_name_unique.up.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/queries/settings.sql" dialect="PostgreSQL" />
   </component>
 </project>

@@ -12,62 +12,65 @@ import (
 	"github.com/google/uuid"
 )
 
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too.
+
 // ---------------------------------------------------------------------------
 // Hand-written mocks (no third-party mocking dependency)
 // ---------------------------------------------------------------------------
 
 type mockRepo struct {
-	createCV       func(ctx context.Context, name string, tag *string) (*CV, error)
-	getCV          func(ctx context.Context, id uuid.UUID) (*CV, error)
-	getCVByName    func(ctx context.Context, name string) (*CV, error)
-	listCVs        func(ctx context.Context) ([]CV, error)
-	deleteCV       func(ctx context.Context, id uuid.UUID) error
+	createCV       func(ctx context.Context, userID uuid.UUID, name string, tag *string) (*CV, error)
+	getCV          func(ctx context.Context, userID, id uuid.UUID) (*CV, error)
+	getCVByName    func(ctx context.Context, userID uuid.UUID, name string) (*CV, error)
+	listCVs        func(ctx context.Context, userID uuid.UUID) ([]CV, error)
+	deleteCV       func(ctx context.Context, userID, id uuid.UUID) error
 	createVersion  func(ctx context.Context, in NewVersion) (*CVVersion, error)
-	getVersion     func(ctx context.Context, id uuid.UUID) (*CVVersion, error)
-	listForCV      func(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error)
-	listAll        func(ctx context.Context) ([]CVVersion, error)
-	byHash         func(ctx context.Context, hash string) (*CVVersion, error)
-	byFilename     func(ctx context.Context, filename string) (*CVVersion, error)
-	byCVAndSize    func(ctx context.Context, cvID uuid.UUID, size int64) (*CVVersion, error)
-	byCVAndHash    func(ctx context.Context, cvID uuid.UUID, hash string) (*CVVersion, error)
-	listUsage      func(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error)
-	lastUsageForCV func(ctx context.Context, cvID uuid.UUID) (*ApplicationUsage, error)
+	getVersion     func(ctx context.Context, userID, id uuid.UUID) (*CVVersion, error)
+	listForCV      func(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error)
+	listAll        func(ctx context.Context, userID uuid.UUID) ([]CVVersion, error)
+	byHash         func(ctx context.Context, userID uuid.UUID, hash string) (*CVVersion, error)
+	byFilename     func(ctx context.Context, userID uuid.UUID, filename string) (*CVVersion, error)
+	byCVAndSize    func(ctx context.Context, userID, cvID uuid.UUID, size int64) (*CVVersion, error)
+	byCVAndHash    func(ctx context.Context, userID, cvID uuid.UUID, hash string) (*CVVersion, error)
+	listUsage      func(ctx context.Context, userID, versionID uuid.UUID) ([]ApplicationUsage, error)
+	lastUsageForCV func(ctx context.Context, userID, cvID uuid.UUID) (*ApplicationUsage, error)
 
 	deletedCVs []uuid.UUID
 }
 
-func (m *mockRepo) CreateCV(ctx context.Context, name string, tag *string) (*CV, error) {
+func (m *mockRepo) CreateCV(ctx context.Context, userID uuid.UUID, name string, tag *string) (*CV, error) {
 	if m.createCV != nil {
-		return m.createCV(ctx, name, tag)
+		return m.createCV(ctx, userID, name, tag)
 	}
 	return &CV{ID: uuid.New(), Name: name, Tag: tag}, nil
 }
 
-func (m *mockRepo) GetCV(ctx context.Context, id uuid.UUID) (*CV, error) {
+func (m *mockRepo) GetCV(ctx context.Context, userID, id uuid.UUID) (*CV, error) {
 	if m.getCV != nil {
-		return m.getCV(ctx, id)
+		return m.getCV(ctx, userID, id)
 	}
 	return &CV{ID: id, Name: "Some CV"}, nil
 }
 
-func (m *mockRepo) GetCVByName(ctx context.Context, name string) (*CV, error) {
+func (m *mockRepo) GetCVByName(ctx context.Context, userID uuid.UUID, name string) (*CV, error) {
 	if m.getCVByName != nil {
-		return m.getCVByName(ctx, name)
+		return m.getCVByName(ctx, userID, name)
 	}
 	return nil, ErrCVNotFound
 }
 
-func (m *mockRepo) ListCVs(ctx context.Context) ([]CV, error) {
+func (m *mockRepo) ListCVs(ctx context.Context, userID uuid.UUID) ([]CV, error) {
 	if m.listCVs != nil {
-		return m.listCVs(ctx)
+		return m.listCVs(ctx, userID)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) DeleteCV(ctx context.Context, id uuid.UUID) error {
+func (m *mockRepo) DeleteCV(ctx context.Context, userID, id uuid.UUID) error {
 	m.deletedCVs = append(m.deletedCVs, id)
 	if m.deleteCV != nil {
-		return m.deleteCV(ctx, id)
+		return m.deleteCV(ctx, userID, id)
 	}
 	return nil
 }
@@ -87,65 +90,77 @@ func (m *mockRepo) CreateVersion(ctx context.Context, in NewVersion) (*CVVersion
 	}, nil
 }
 
-func (m *mockRepo) GetVersion(ctx context.Context, id uuid.UUID) (*CVVersion, error) {
+func (m *mockRepo) GetVersion(ctx context.Context, userID, id uuid.UUID) (*CVVersion, error) {
 	if m.getVersion != nil {
-		return m.getVersion(ctx, id)
+		return m.getVersion(ctx, userID, id)
 	}
 	return nil, ErrVersionNotFound
 }
 
-func (m *mockRepo) ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CVVersion, error) {
+func (m *mockRepo) ListVersionsForCV(ctx context.Context, userID, cvID uuid.UUID) ([]CVVersion, error) {
 	if m.listForCV != nil {
-		return m.listForCV(ctx, cvID)
+		return m.listForCV(ctx, userID, cvID)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) ListAllVersions(ctx context.Context) ([]CVVersion, error) {
+func (m *mockRepo) ListAllVersions(ctx context.Context, userID uuid.UUID) ([]CVVersion, error) {
 	if m.listAll != nil {
-		return m.listAll(ctx)
+		return m.listAll(ctx, userID)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) FindVersionByHash(ctx context.Context, hash string) (*CVVersion, error) {
+func (m *mockRepo) FindVersionByHash(ctx context.Context, userID uuid.UUID, hash string) (*CVVersion, error) {
 	if m.byHash != nil {
-		return m.byHash(ctx, hash)
+		return m.byHash(ctx, userID, hash)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) FindLatestVersionByFilename(ctx context.Context, filename string) (*CVVersion, error) {
+func (m *mockRepo) FindLatestVersionByFilename(ctx context.Context, userID uuid.UUID, filename string) (
+	*CVVersion,
+	error,
+) {
 	if m.byFilename != nil {
-		return m.byFilename(ctx, filename)
+		return m.byFilename(ctx, userID, filename)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) FindVersionByCVAndSize(ctx context.Context, cvID uuid.UUID, size int64) (*CVVersion, error) {
+func (m *mockRepo) FindVersionByCVAndSize(ctx context.Context, userID, cvID uuid.UUID, size int64) (
+	*CVVersion,
+	error,
+) {
 	if m.byCVAndSize != nil {
-		return m.byCVAndSize(ctx, cvID, size)
+		return m.byCVAndSize(ctx, userID, cvID, size)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) FindVersionByCVAndHash(ctx context.Context, cvID uuid.UUID, hash string) (*CVVersion, error) {
+func (m *mockRepo) FindVersionByCVAndHash(ctx context.Context, userID, cvID uuid.UUID, hash string) (
+	*CVVersion,
+	error,
+) {
 	if m.byCVAndHash != nil {
-		return m.byCVAndHash(ctx, cvID, hash)
+		return m.byCVAndHash(ctx, userID, cvID, hash)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) ListApplicationsUsingVersion(ctx context.Context, versionID uuid.UUID) ([]ApplicationUsage, error) {
+func (m *mockRepo) ListApplicationsUsingVersion(ctx context.Context, userID, versionID uuid.UUID) (
+	[]ApplicationUsage,
+	error,
+) {
 	if m.listUsage != nil {
-		return m.listUsage(ctx, versionID)
+		return m.listUsage(ctx, userID, versionID)
 	}
 	return nil, nil
 }
 
-func (m *mockRepo) LastUsageForCV(ctx context.Context, cvID uuid.UUID) (*ApplicationUsage, error) {
+func (m *mockRepo) LastUsageForCV(ctx context.Context, userID, cvID uuid.UUID) (*ApplicationUsage, error) {
 	if m.lastUsageForCV != nil {
-		return m.lastUsageForCV(ctx, cvID)
+		return m.lastUsageForCV(ctx, userID, cvID)
 	}
 	return nil, nil
 }
@@ -191,23 +206,23 @@ func TestMatch_HashMatch_ReturnsMatched(t *testing.T) {
 	cvID := uuid.New()
 	versionID := uuid.New()
 	repo := &mockRepo{
-		byHash: func(_ context.Context, hash string) (*CVVersion, error) {
+		byHash: func(_ context.Context, _ uuid.UUID, hash string) (*CVVersion, error) {
 			if hash != "abc123" {
 				t.Fatalf("expected hash abc123, got %q", hash)
 			}
 			return &CVVersion{ID: versionID, CVID: cvID}, nil
 		},
-		byFilename: func(context.Context, string) (*CVVersion, error) {
+		byFilename: func(context.Context, uuid.UUID, string) (*CVVersion, error) {
 			t.Fatal("filename lookup must not run once the hash matches")
 			return nil, nil
 		},
-		getCV: func(_ context.Context, id uuid.UUID) (*CV, error) {
+		getCV: func(_ context.Context, _, id uuid.UUID) (*CV, error) {
 			return &CV{ID: id, Name: "Backend CV"}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{
 		SHA256Hash:    "abc123",
 		Filename:      "totally_different_name.pdf",
 		FileSizeBytes: ptrInt64(999),
@@ -231,26 +246,26 @@ func TestMatch_FilenameAndSizeMatch_ReturnsMatched(t *testing.T) {
 	cvID := uuid.New()
 	existing := &CVVersion{ID: uuid.New(), CVID: cvID, FileSizeBytes: 51200}
 	repo := &mockRepo{
-		byHash: func(context.Context, string) (*CVVersion, error) {
+		byHash: func(context.Context, uuid.UUID, string) (*CVVersion, error) {
 			t.Fatal("hash lookup must be skipped when no hash was supplied")
 			return nil, nil
 		},
-		byFilename: func(_ context.Context, filename string) (*CVVersion, error) {
+		byFilename: func(_ context.Context, _ uuid.UUID, filename string) (*CVVersion, error) {
 			return &CVVersion{ID: uuid.New(), CVID: cvID, OriginalFilename: filename}, nil
 		},
-		byCVAndSize: func(_ context.Context, id uuid.UUID, size int64) (*CVVersion, error) {
+		byCVAndSize: func(_ context.Context, _, id uuid.UUID, size int64) (*CVVersion, error) {
 			if id != cvID || size != 51200 {
 				t.Fatalf("decision 4 queried with cv=%s size=%d", id, size)
 			}
 			return existing, nil
 		},
-		getCV: func(_ context.Context, id uuid.UUID) (*CV, error) {
+		getCV: func(_ context.Context, _, id uuid.UUID) (*CV, error) {
 			return &CV{ID: id, Name: "Backend CV"}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{
 		Filename:      "backend_cv.pdf",
 		FileSizeBytes: ptrInt64(51200),
 	})
@@ -272,18 +287,18 @@ func TestMatch_FilenameAndSizeMatch_ReturnsMatched(t *testing.T) {
 func TestMatch_SameFilenameDifferentSize_ReturnsNewVersion(t *testing.T) {
 	cvID := uuid.New()
 	repo := &mockRepo{
-		byHash:     func(context.Context, string) (*CVVersion, error) { return nil, nil },
-		byFilename: func(_ context.Context, _ string) (*CVVersion, error) { return &CVVersion{CVID: cvID}, nil },
-		byCVAndSize: func(context.Context, uuid.UUID, int64) (*CVVersion, error) {
+		byHash:     func(context.Context, uuid.UUID, string) (*CVVersion, error) { return nil, nil },
+		byFilename: func(_ context.Context, _ uuid.UUID, _ string) (*CVVersion, error) { return &CVVersion{CVID: cvID}, nil },
+		byCVAndSize: func(context.Context, uuid.UUID, uuid.UUID, int64) (*CVVersion, error) {
 			return nil, nil
 		},
-		getCV: func(_ context.Context, id uuid.UUID) (*CV, error) {
+		getCV: func(_ context.Context, _, id uuid.UUID) (*CV, error) {
 			return &CV{ID: id, Name: "Backend CV"}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{
 		SHA256Hash:    "nomatch",
 		Filename:      "backend_cv.pdf",
 		FileSizeBytes: ptrInt64(60000),
@@ -307,21 +322,21 @@ func TestMatch_FilenameMatchWithoutSize_ReturnsNeedsConfirmation(t *testing.T) {
 	cvID := uuid.New()
 	appliedAt := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
 	repo := &mockRepo{
-		byFilename: func(_ context.Context, _ string) (*CVVersion, error) { return &CVVersion{CVID: cvID}, nil },
-		getCV: func(_ context.Context, id uuid.UUID) (*CV, error) {
+		byFilename: func(_ context.Context, _ uuid.UUID, _ string) (*CVVersion, error) { return &CVVersion{CVID: cvID}, nil },
+		getCV: func(_ context.Context, _, id uuid.UUID) (*CV, error) {
 			return &CV{ID: id, Name: "Backend CV"}, nil
 		},
-		byCVAndSize: func(context.Context, uuid.UUID, int64) (*CVVersion, error) {
+		byCVAndSize: func(context.Context, uuid.UUID, uuid.UUID, int64) (*CVVersion, error) {
 			t.Fatal("decision 4 cannot run without a file size")
 			return nil, nil
 		},
-		lastUsageForCV: func(context.Context, uuid.UUID) (*ApplicationUsage, error) {
+		lastUsageForCV: func(context.Context, uuid.UUID, uuid.UUID) (*ApplicationUsage, error) {
 			return &ApplicationUsage{CompanyName: "Stripe", AppliedAt: &appliedAt}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{Filename: "backend_cv.pdf"})
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{Filename: "backend_cv.pdf"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -344,14 +359,14 @@ func TestMatch_FilenameMatchWithoutSize_ReturnsNeedsConfirmation(t *testing.T) {
 
 func TestMatch_NeedsConfirmationWithNeverUsedCV_HasNilUsage(t *testing.T) {
 	repo := &mockRepo{
-		byFilename: func(context.Context, string) (*CVVersion, error) {
+		byFilename: func(context.Context, uuid.UUID, string) (*CVVersion, error) {
 			return &CVVersion{CVID: uuid.New()}, nil
 		},
-		lastUsageForCV: func(context.Context, uuid.UUID) (*ApplicationUsage, error) { return nil, nil },
+		lastUsageForCV: func(context.Context, uuid.UUID, uuid.UUID) (*ApplicationUsage, error) { return nil, nil },
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{Filename: "never_sent.pdf"})
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{Filename: "never_sent.pdf"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -366,12 +381,12 @@ func TestMatch_NeedsConfirmationWithNeverUsedCV_HasNilUsage(t *testing.T) {
 // Decision 3 NO → Terminal Outcome 4.
 func TestMatch_NoMatchAtAll_ReturnsUnknown(t *testing.T) {
 	repo := &mockRepo{
-		byHash:     func(context.Context, string) (*CVVersion, error) { return nil, nil },
-		byFilename: func(context.Context, string) (*CVVersion, error) { return nil, nil },
+		byHash:     func(context.Context, uuid.UUID, string) (*CVVersion, error) { return nil, nil },
+		byFilename: func(context.Context, uuid.UUID, string) (*CVVersion, error) { return nil, nil },
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Match(context.Background(), MatchQuery{
+	got, err := svc.Match(context.Background(), testUserID, MatchQuery{
 		SHA256Hash:    "deadbeef",
 		Filename:      "brand_new.pdf",
 		FileSizeBytes: ptrInt64(1234),
@@ -389,7 +404,9 @@ func TestMatch_NoMatchAtAll_ReturnsUnknown(t *testing.T) {
 
 func TestMatch_EmptyFilename_IsRejected(t *testing.T) {
 	svc := NewService(&mockRepo{}, &mockStorage{})
-	if _, err := svc.Match(context.Background(), MatchQuery{Filename: "   "}); !errors.Is(err, ErrFilenameEmpty) {
+	if _, err := svc.Match(
+		context.Background(), testUserID, MatchQuery{Filename: "   "},
+	); !errors.Is(err, ErrFilenameEmpty) {
 		t.Errorf("err = %v, want ErrFilenameEmpty", err)
 	}
 }
@@ -397,10 +414,12 @@ func TestMatch_EmptyFilename_IsRejected(t *testing.T) {
 func TestMatch_RepositoryFailurePropagates(t *testing.T) {
 	boom := errors.New("connection reset")
 	repo := &mockRepo{
-		byHash: func(context.Context, string) (*CVVersion, error) { return nil, boom },
+		byHash: func(context.Context, uuid.UUID, string) (*CVVersion, error) { return nil, boom },
 	}
 	svc := NewService(repo, &mockStorage{})
-	if _, err := svc.Match(context.Background(), MatchQuery{SHA256Hash: "x", Filename: "a.pdf"}); !errors.Is(err, boom) {
+	if _, err := svc.Match(
+		context.Background(), testUserID, MatchQuery{SHA256Hash: "x", Filename: "a.pdf"},
+	); !errors.Is(err, boom) {
 		t.Errorf("err = %v, want the repository error", err)
 	}
 }
@@ -416,7 +435,7 @@ func TestUpload_NewCV_ComputesHashAndStoresFile(t *testing.T) {
 
 	var created NewVersion
 	repo := &mockRepo{
-		createCV: func(_ context.Context, name string, _ *string) (*CV, error) {
+		createCV: func(_ context.Context, _ uuid.UUID, name string, _ *string) (*CV, error) {
 			if name != "backend cv v3" {
 				t.Errorf("derived cv name = %q, want %q", name, "backend cv v3")
 			}
@@ -430,7 +449,7 @@ func TestUpload_NewCV_ComputesHashAndStoresFile(t *testing.T) {
 	store := &mockStorage{}
 	svc := NewService(repo, store)
 
-	got, err := svc.Upload(context.Background(), UploadInput{
+	got, err := svc.Upload(context.Background(), testUserID, UploadInput{
 		Filename:    "backend_cv_v3.pdf",
 		Content:     content,
 		ContentType: "application/pdf",
@@ -447,6 +466,9 @@ func TestUpload_NewCV_ComputesHashAndStoresFile(t *testing.T) {
 	if created.OriginalFilename != "backend_cv_v3.pdf" {
 		t.Errorf("original filename = %q", created.OriginalFilename)
 	}
+	if created.UserID != testUserID {
+		t.Errorf("version user_id = %s, want %s", created.UserID, testUserID)
+	}
 	if len(store.uploadedKeys) != 1 || store.uploadedKeys[0] != created.S3Key {
 		t.Fatalf("expected the file to be stored under %q, got %v", created.S3Key, store.uploadedKeys)
 	}
@@ -461,15 +483,15 @@ func TestUpload_NewCV_ComputesHashAndStoresFile(t *testing.T) {
 func TestUpload_ExistingCV_DoesNotCreateAnotherGroup(t *testing.T) {
 	cvID := uuid.New()
 	repo := &mockRepo{
-		createCV: func(context.Context, string, *string) (*CV, error) {
+		createCV: func(context.Context, uuid.UUID, string, *string) (*CV, error) {
 			t.Fatal("must not create a CV group when cv_id was supplied")
 			return nil, nil
 		},
-		getCV: func(_ context.Context, id uuid.UUID) (*CV, error) { return &CV{ID: id, Name: "Backend CV"}, nil },
+		getCV: func(_ context.Context, _, id uuid.UUID) (*CV, error) { return &CV{ID: id, Name: "Backend CV"}, nil },
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.Upload(context.Background(), UploadInput{
+	got, err := svc.Upload(context.Background(), testUserID, UploadInput{
 		Filename: "backend_cv.pdf",
 		Content:  []byte("bytes"),
 		CVID:     &cvID,
@@ -486,17 +508,17 @@ func TestUpload_IdenticalBytesUnderSameCV_IsIdempotent(t *testing.T) {
 	cvID := uuid.New()
 	existing := &CVVersion{ID: uuid.New(), CVID: cvID}
 	repo := &mockRepo{
-		getCV:       func(_ context.Context, id uuid.UUID) (*CV, error) { return &CV{ID: id}, nil },
-		byCVAndHash: func(context.Context, uuid.UUID, string) (*CVVersion, error) { return existing, nil },
+		getCV:       func(_ context.Context, _, id uuid.UUID) (*CV, error) { return &CV{ID: id}, nil },
+		byCVAndHash: func(context.Context, uuid.UUID, uuid.UUID, string) (*CVVersion, error) { return existing, nil },
 		createVersion: func(context.Context, NewVersion) (*CVVersion, error) {
-			t.Fatal("must not insert a duplicate row — unique(cv_id, sha256_hash)")
+			t.Fatal("must not insert a duplicate row — unique(user_id, cv_id, sha256_hash)")
 			return nil, nil
 		},
 	}
 	store := &mockStorage{}
 	svc := NewService(repo, store)
 
-	got, err := svc.Upload(context.Background(), UploadInput{
+	got, err := svc.Upload(context.Background(), testUserID, UploadInput{
 		Filename: "backend_cv.pdf",
 		Content:  []byte("same bytes"),
 		CVID:     &cvID,
@@ -516,13 +538,13 @@ func TestUpload_DatabaseFailure_RollsBackS3AndCVGroup(t *testing.T) {
 	boom := errors.New("insert failed")
 	cvID := uuid.New()
 	repo := &mockRepo{
-		createCV:      func(_ context.Context, name string, _ *string) (*CV, error) { return &CV{ID: cvID, Name: name}, nil },
+		createCV:      func(_ context.Context, _ uuid.UUID, name string, _ *string) (*CV, error) { return &CV{ID: cvID, Name: name}, nil },
 		createVersion: func(context.Context, NewVersion) (*CVVersion, error) { return nil, boom },
 	}
 	store := &mockStorage{}
 	svc := NewService(repo, store)
 
-	if _, err := svc.Upload(context.Background(), UploadInput{
+	if _, err := svc.Upload(context.Background(), testUserID, UploadInput{
 		Filename: "backend_cv.pdf",
 		Content:  []byte("bytes"),
 	}); !errors.Is(err, boom) {
@@ -550,7 +572,7 @@ func TestUpload_Validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := svc.Upload(context.Background(), tc.in); !errors.Is(err, tc.want) {
+			if _, err := svc.Upload(context.Background(), testUserID, tc.in); !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
 		})
@@ -577,13 +599,15 @@ func TestDeriveCVName(t *testing.T) {
 func TestDownloadURL_VersionBelongingToAnotherCV_IsNotFound(t *testing.T) {
 	versionID := uuid.New()
 	repo := &mockRepo{
-		getVersion: func(_ context.Context, id uuid.UUID) (*CVVersion, error) {
+		getVersion: func(_ context.Context, _, id uuid.UUID) (*CVVersion, error) {
 			return &CVVersion{ID: id, CVID: uuid.New(), S3Key: "cvs/x/y/cv.pdf"}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	if _, err := svc.DownloadURL(context.Background(), uuid.New(), versionID); !errors.Is(err, ErrVersionNotFound) {
+	if _, err := svc.DownloadURL(
+		context.Background(), testUserID, uuid.New(), versionID,
+	); !errors.Is(err, ErrVersionNotFound) {
 		t.Errorf("err = %v, want ErrVersionNotFound", err)
 	}
 }
@@ -591,13 +615,13 @@ func TestDownloadURL_VersionBelongingToAnotherCV_IsNotFound(t *testing.T) {
 func TestDownloadURL_ReturnsPresignedLink(t *testing.T) {
 	cvID := uuid.New()
 	repo := &mockRepo{
-		getVersion: func(_ context.Context, id uuid.UUID) (*CVVersion, error) {
+		getVersion: func(_ context.Context, _, id uuid.UUID) (*CVVersion, error) {
 			return &CVVersion{ID: id, CVID: cvID, S3Key: "cvs/a/b/cv.pdf", OriginalFilename: "cv.pdf"}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{}, WithDownloadTTL(5*time.Minute))
 
-	link, err := svc.DownloadURL(context.Background(), cvID, uuid.New())
+	link, err := svc.DownloadURL(context.Background(), testUserID, cvID, uuid.New())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -617,10 +641,10 @@ func TestListWithVersions_GroupsVersionsByCVNewestFirst(t *testing.T) {
 	older := time.Now().Add(-48 * time.Hour)
 	newer := time.Now().Add(-1 * time.Hour)
 	repo := &mockRepo{
-		listCVs: func(context.Context) ([]CV, error) {
+		listCVs: func(context.Context, uuid.UUID) ([]CV, error) {
 			return []CV{{ID: cvA, Name: "A"}, {ID: cvB, Name: "B"}}, nil
 		},
-		listAll: func(context.Context) ([]CVVersion, error) {
+		listAll: func(context.Context, uuid.UUID) ([]CVVersion, error) {
 			return []CVVersion{
 				{ID: uuid.New(), CVID: cvA, UploadedAt: older},
 				{ID: uuid.New(), CVID: cvA, UploadedAt: newer},
@@ -629,7 +653,7 @@ func TestListWithVersions_GroupsVersionsByCVNewestFirst(t *testing.T) {
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.ListWithVersions(context.Background())
+	got, err := svc.ListWithVersions(context.Background(), testUserID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

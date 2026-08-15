@@ -12,7 +12,19 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
+
+// testUserID is the caller every request in this file is authenticated as —
+// see middleware.TestContextWithUserID for why these tests inject it directly
+// rather than running a real RequireAuth in front of the router.
+//
+// If this collides with a var of the same name declared alongside linkedIn,
+// cvVersion and fixedNow (wherever those live — not in this file), rename
+// either one; this package apparently splits its test fixtures across files
+// this change never saw.
+var testUserID = uuid.New()
 
 // fakeService records what the handler passed down and returns canned answers,
 // so these tests cover routing, decoding, query parsing and status codes only.
@@ -25,6 +37,7 @@ type fakeService struct {
 	deletedID  uuid.UUID
 	completeID uuid.UUID
 	completeIn CompleteInput
+	gotUser    uuid.UUID
 
 	createResult   *CreateResult
 	application    *Application
@@ -34,39 +47,43 @@ type fakeService struct {
 	err            error
 }
 
-func (f *fakeService) Create(_ context.Context, in CreateInput) (*CreateResult, error) {
-	f.createIn = in
+func (f *fakeService) Create(_ context.Context, userID uuid.UUID, in CreateInput) (*CreateResult, error) {
+	f.createIn, f.gotUser = in, userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.createResult, nil
 }
 
-func (f *fakeService) Get(_ context.Context, _ uuid.UUID) (*Application, error) {
+func (f *fakeService) Get(_ context.Context, userID, _ uuid.UUID) (*Application, error) {
+	f.gotUser = userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.application, nil
 }
 
-func (f *fakeService) List(_ context.Context, filter ListFilter) ([]Application, error) {
-	f.listIn = filter
+func (f *fakeService) List(_ context.Context, userID uuid.UUID, filter ListFilter) ([]Application, error) {
+	f.listIn, f.gotUser = filter, userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.list, nil
 }
 
-func (f *fakeService) Update(_ context.Context, _ uuid.UUID, in UpdateInput) (*Application, error) {
-	f.updateIn = in
+func (f *fakeService) Update(_ context.Context, userID, _ uuid.UUID, in UpdateInput) (*Application, error) {
+	f.updateIn, f.gotUser = in, userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.application, nil
 }
 
-func (f *fakeService) UpdateStatus(_ context.Context, _ uuid.UUID, in StatusUpdateInput) (*Application, error) {
-	f.statusIn = in
+func (f *fakeService) UpdateStatus(_ context.Context, userID, _ uuid.UUID, in StatusUpdateInput) (
+	*Application,
+	error,
+) {
+	f.statusIn, f.gotUser = in, userID
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -74,32 +91,35 @@ func (f *fakeService) UpdateStatus(_ context.Context, _ uuid.UUID, in StatusUpda
 }
 
 // Complete backs PATCH /applications/{id}/complete — Phase 13, Flow 2.
-func (f *fakeService) Complete(_ context.Context, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
-	f.completeID = id
-	f.completeIn = in
+func (f *fakeService) Complete(_ context.Context, userID, id uuid.UUID, in CompleteInput) (*CompleteResult, error) {
+	f.completeID, f.completeIn, f.gotUser = id, in, userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.completeResult, nil
 }
 
-func (f *fakeService) Delete(_ context.Context, id uuid.UUID) error {
-	f.deletedID = id
+func (f *fakeService) Delete(_ context.Context, userID, id uuid.UUID) error {
+	f.deletedID, f.gotUser = id, userID
 	return f.err
 }
 
 // CheckDuplicate takes a DuplicateQuery as of Phase 13, rather than a bare
 // company string, so a title (and site) can sharpen the match into
 // LikelySame/CrossSite rather than only Matches.
-func (f *fakeService) CheckDuplicate(_ context.Context, q DuplicateQuery) (*DuplicateWarning, error) {
-	f.dupIn = q
+func (f *fakeService) CheckDuplicate(_ context.Context, userID uuid.UUID, q DuplicateQuery) (
+	*DuplicateWarning,
+	error,
+) {
+	f.dupIn, f.gotUser = q, userID
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.duplicate, nil
 }
 
-func (f *fakeService) StatusHistory(_ context.Context, _ uuid.UUID) ([]StatusHistory, error) {
+func (f *fakeService) StatusHistory(_ context.Context, userID, _ uuid.UUID) ([]StatusHistory, error) {
+	f.gotUser = userID
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -141,6 +161,7 @@ func do(t *testing.T, router *chi.Mux, method, target, body string) *httptest.Re
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req = req.WithContext(middleware.TestContextWithUserID(req.Context(), testUserID))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
@@ -179,6 +200,9 @@ func TestPostApplicationCreated(t *testing.T) {
 	}
 	if svc.createIn.CoverLetterText == nil {
 		t.Error("cover letter text did not reach the service")
+	}
+	if svc.gotUser != testUserID {
+		t.Errorf("userID passed to service = %s, want %s", svc.gotUser, testUserID)
 	}
 
 	body := decodeBody(t, rec)

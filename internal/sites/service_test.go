@@ -9,10 +9,18 @@ import (
 	"github.com/google/uuid"
 )
 
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too. These tests
+// exercise business logic (normalisation, idempotent seeding, validation), not
+// the global-or-owned scoping that lives in the real SQL, so one fixed caller
+// throughout is enough.
+
 // fakeRepo is an in-memory Repository. It reproduces the two behaviours the
 // service actually leans on: Ensure is a silent no-op when the name or domain is
 // taken, and Delete can fail with ErrInUse the way the applications foreign key
-// does.
+// does. It does not reproduce global-or-owned filtering — every row is visible
+// to any userID the tests pass in — since that scoping is the real Repository's
+// job, not this fake's.
 type fakeRepo struct {
 	rows      []Site
 	deleteErr error
@@ -63,7 +71,7 @@ func (f *fakeRepo) Ensure(ctx context.Context, in NewSite) (*Site, error) {
 	return f.Create(ctx, in)
 }
 
-func (f *fakeRepo) List(_ context.Context, filter ListFilter) ([]Site, error) {
+func (f *fakeRepo) List(_ context.Context, _ uuid.UUID, filter ListFilter) ([]Site, error) {
 	out := make([]Site, 0, len(f.rows))
 	for _, row := range f.rows {
 		if filter.ActiveOnly && !row.IsActive {
@@ -74,7 +82,7 @@ func (f *fakeRepo) List(_ context.Context, filter ListFilter) ([]Site, error) {
 	return out, nil
 }
 
-func (f *fakeRepo) Get(_ context.Context, id uuid.UUID) (*Site, error) {
+func (f *fakeRepo) Get(_ context.Context, _, id uuid.UUID) (*Site, error) {
 	i := f.index(id)
 	if i < 0 {
 		return nil, ErrNotFound
@@ -83,7 +91,7 @@ func (f *fakeRepo) Get(_ context.Context, id uuid.UUID) (*Site, error) {
 	return &site, nil
 }
 
-func (f *fakeRepo) GetByDomain(_ context.Context, domain string) (*Site, error) {
+func (f *fakeRepo) GetByDomain(_ context.Context, _ uuid.UUID, domain string) (*Site, error) {
 	for i := range f.rows {
 		if f.rows[i].Domain == domain {
 			site := f.rows[i]
@@ -93,7 +101,7 @@ func (f *fakeRepo) GetByDomain(_ context.Context, domain string) (*Site, error) 
 	return nil, ErrNotFound
 }
 
-func (f *fakeRepo) SetActive(_ context.Context, id uuid.UUID, active bool) (*Site, error) {
+func (f *fakeRepo) SetActive(_ context.Context, _, id uuid.UUID, active bool) (*Site, error) {
 	i := f.index(id)
 	if i < 0 {
 		return nil, ErrNotFound
@@ -103,7 +111,7 @@ func (f *fakeRepo) SetActive(_ context.Context, id uuid.UUID, active bool) (*Sit
 	return &site, nil
 }
 
-func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
+func (f *fakeRepo) Delete(_ context.Context, _, id uuid.UUID) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
@@ -229,7 +237,7 @@ func TestAddNormalizesDomainAndDefaults(t *testing.T) {
 	repo := newFakeRepo()
 
 	site, err := NewService(repo).Add(
-		context.Background(),
+		context.Background(), testUserID,
 		AddInput{Name: "  Acme Careers  ", Domain: "https://WWW.Acme.com/jobs?ref=1"},
 	)
 	if err != nil {
@@ -269,7 +277,9 @@ func TestAddValidation(t *testing.T) {
 		t.Run(
 			tt.name, func(t *testing.T) {
 				repo := newFakeRepo()
-				if _, err := NewService(repo).Add(context.Background(), tt.in); !errors.Is(err, tt.wants) {
+				if _, err := NewService(repo).Add(context.Background(), testUserID, tt.in); !errors.Is(
+					err, tt.wants,
+				) {
 					t.Fatalf("err = %v, want %v", err, tt.wants)
 				}
 				if len(repo.rows) != 0 {
@@ -286,7 +296,7 @@ func TestAddRejectsExistingDomain(t *testing.T) {
 	repo := newFakeRepo(preconfiguredSite("LinkedIn", "linkedin.com", true))
 
 	_, err := NewService(repo).Add(
-		context.Background(),
+		context.Background(), testUserID,
 		AddInput{Name: "LinkedIn Jobs", Domain: "https://www.linkedin.com/jobs"},
 	)
 	if !errors.Is(err, ErrDuplicate) {
@@ -307,7 +317,7 @@ func TestToggleActiveFlipsBothWays(t *testing.T) {
 	svc := NewService(repo)
 	ctx := context.Background()
 
-	site, err := svc.ToggleActive(ctx, seed.ID)
+	site, err := svc.ToggleActive(ctx, testUserID, seed.ID)
 	if err != nil {
 		t.Fatalf("first toggle: %v", err)
 	}
@@ -315,7 +325,7 @@ func TestToggleActiveFlipsBothWays(t *testing.T) {
 		t.Error("is_active = false after first toggle, want true")
 	}
 
-	site, err = svc.ToggleActive(ctx, seed.ID)
+	site, err = svc.ToggleActive(ctx, testUserID, seed.ID)
 	if err != nil {
 		t.Fatalf("second toggle: %v", err)
 	}
@@ -330,7 +340,7 @@ func TestTogglePreconfiguredIsAllowed(t *testing.T) {
 	seed := preconfiguredSite("LinkedIn", "linkedin.com", true)
 	repo := newFakeRepo(seed)
 
-	site, err := NewService(repo).ToggleActive(context.Background(), seed.ID)
+	site, err := NewService(repo).ToggleActive(context.Background(), testUserID, seed.ID)
 	if err != nil {
 		t.Fatalf("ToggleActive: %v", err)
 	}
@@ -345,7 +355,9 @@ func TestTogglePreconfiguredIsAllowed(t *testing.T) {
 func TestToggleUnknownSite(t *testing.T) {
 	repo := newFakeRepo()
 
-	if _, err := NewService(repo).ToggleActive(context.Background(), uuid.New()); !errors.Is(err, ErrNotFound) {
+	if _, err := NewService(repo).ToggleActive(
+		context.Background(), testUserID, uuid.New(),
+	); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -358,7 +370,7 @@ func TestDeleteBlockedForPreconfigured(t *testing.T) {
 	seed := preconfiguredSite("LinkedIn", "linkedin.com", true)
 	repo := newFakeRepo(seed)
 
-	err := NewService(repo).Delete(context.Background(), seed.ID)
+	err := NewService(repo).Delete(context.Background(), testUserID, seed.ID)
 	if !errors.Is(err, ErrPreconfigured) {
 		t.Fatalf("err = %v, want ErrPreconfigured", err)
 	}
@@ -374,7 +386,7 @@ func TestDeleteAllowedForCustom(t *testing.T) {
 	seed := customSite("Acme", "acme.com", true)
 	repo := newFakeRepo(seed)
 
-	if err := NewService(repo).Delete(context.Background(), seed.ID); err != nil {
+	if err := NewService(repo).Delete(context.Background(), testUserID, seed.ID); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if len(repo.rows) != 0 {
@@ -385,7 +397,9 @@ func TestDeleteAllowedForCustom(t *testing.T) {
 func TestDeleteUnknownSite(t *testing.T) {
 	repo := newFakeRepo()
 
-	if err := NewService(repo).Delete(context.Background(), uuid.New()); !errors.Is(err, ErrNotFound) {
+	if err := NewService(repo).Delete(
+		context.Background(), testUserID, uuid.New(),
+	); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -397,7 +411,9 @@ func TestDeleteSurfacesInUse(t *testing.T) {
 	repo := newFakeRepo(seed)
 	repo.deleteErr = ErrInUse
 
-	if err := NewService(repo).Delete(context.Background(), seed.ID); !errors.Is(err, ErrInUse) {
+	if err := NewService(repo).Delete(
+		context.Background(), testUserID, seed.ID,
+	); !errors.Is(err, ErrInUse) {
 		t.Fatalf("err = %v, want ErrInUse", err)
 	}
 }
@@ -415,7 +431,7 @@ func TestListActiveOnly(t *testing.T) {
 	svc := NewService(repo)
 	ctx := context.Background()
 
-	all, err := svc.List(ctx, ListFilter{})
+	all, err := svc.List(ctx, testUserID, ListFilter{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -423,7 +439,7 @@ func TestListActiveOnly(t *testing.T) {
 		t.Errorf("unfiltered list returned %d sites, want 3", len(all))
 	}
 
-	active, err := svc.List(ctx, ListFilter{ActiveOnly: true})
+	active, err := svc.List(ctx, testUserID, ListFilter{ActiveOnly: true})
 	if err != nil {
 		t.Fatalf("List active: %v", err)
 	}

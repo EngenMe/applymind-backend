@@ -171,6 +171,15 @@ var (
 	ErrEmailInvalid     = errors.New("auth: email is not a valid address")
 	ErrPasswordTooShort = errors.New("auth: password is too short")
 
+	// ErrPasswordTooLong is bcrypt's own 72-byte ceiling surfaced as a domain
+	// error. It exists because this module has no composition rules and tells
+	// users that length is the whole requirement — which reliably produces
+	// someone pasting a passphrase over the limit. Without this they would get
+	// a 500 for following the advice, or, on an older x/crypto that truncates
+	// silently instead of erroring, an account whose password is its own first
+	// 72 bytes and whose remainder never mattered.
+	ErrPasswordTooLong = errors.New("auth: password is too long")
+
 	// ErrSessionInvalid covers expired, revoked and never-existed alike. The
 	// caller gets one answer because the difference is not theirs to know.
 	ErrSessionInvalid = errors.New("auth: session is not valid")

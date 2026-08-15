@@ -10,15 +10,18 @@ import (
 	"github.com/google/uuid"
 )
 
+// testUserID is declared in handler_test.go — Go test files in a package share
+// one namespace, so it is declared once there and used here too.
+
 // ---------------------------------------------------------------------------
 // Hand-written mocks (no third-party mocking dependency)
 // ---------------------------------------------------------------------------
 
 type mockRepo struct {
 	create     func(ctx context.Context, in NewCoverLetter) (*CoverLetter, error)
-	get        func(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error)
-	updateText func(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error)
-	remove     func(ctx context.Context, applicationID uuid.UUID) error
+	get        func(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error)
+	updateText func(ctx context.Context, userID, applicationID uuid.UUID, body string) (*CoverLetter, error)
+	remove     func(ctx context.Context, userID, applicationID uuid.UUID) error
 
 	created     []NewCoverLetter
 	deletedRows []uuid.UUID
@@ -43,16 +46,19 @@ func (m *mockRepo) Create(ctx context.Context, in NewCoverLetter) (*CoverLetter,
 
 // The default is "this application has no cover letter yet", which is the
 // starting state for every save test.
-func (m *mockRepo) GetByApplicationID(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error) {
+func (m *mockRepo) GetByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error) {
 	if m.get != nil {
-		return m.get(ctx, applicationID)
+		return m.get(ctx, userID, applicationID)
 	}
 	return nil, ErrNotFound
 }
 
-func (m *mockRepo) UpdateTextBody(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error) {
+func (m *mockRepo) UpdateTextBody(ctx context.Context, userID, applicationID uuid.UUID, body string) (
+	*CoverLetter,
+	error,
+) {
 	if m.updateText != nil {
-		return m.updateText(ctx, applicationID, body)
+		return m.updateText(ctx, userID, applicationID, body)
 	}
 	return &CoverLetter{
 		ID:            uuid.New(),
@@ -63,10 +69,10 @@ func (m *mockRepo) UpdateTextBody(ctx context.Context, applicationID uuid.UUID, 
 	}, nil
 }
 
-func (m *mockRepo) DeleteByApplicationID(ctx context.Context, applicationID uuid.UUID) error {
+func (m *mockRepo) DeleteByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) error {
 	m.deletedRows = append(m.deletedRows, applicationID)
 	if m.remove != nil {
-		return m.remove(ctx, applicationID)
+		return m.remove(ctx, userID, applicationID)
 	}
 	return nil
 }
@@ -120,7 +126,7 @@ func TestSaveText_StoresTrimmedBodyAsTextKind(t *testing.T) {
 	svc := NewService(repo, store, WithIDGenerator(func() uuid.UUID { return id }))
 
 	got, err := svc.SaveText(
-		context.Background(), SaveTextInput{
+		context.Background(), testUserID, SaveTextInput{
 			ApplicationID: appID,
 			BodyText:      "  Dear hiring manager,\n\nI would like to apply.  ",
 		},
@@ -138,6 +144,9 @@ func TestSaveText_StoresTrimmedBodyAsTextKind(t *testing.T) {
 	}
 	if in.ID != id || in.ApplicationID != appID {
 		t.Errorf("row = %+v, want id %s on application %s", in, id, appID)
+	}
+	if in.UserID != testUserID {
+		t.Errorf("row user_id = %s, want %s", in.UserID, testUserID)
 	}
 	if in.BodyText == nil {
 		t.Fatal("body_text must be set for a text cover letter")
@@ -163,7 +172,7 @@ func TestSaveText_BlankBodyIsRejected(t *testing.T) {
 
 	for _, body := range []string{"", "   ", "\n\t "} {
 		if _, err := svc.SaveText(
-			context.Background(),
+			context.Background(), testUserID,
 			SaveTextInput{ApplicationID: uuid.New(), BodyText: body},
 		); !errors.Is(err, ErrEmptyBody) {
 			t.Errorf("SaveText(%q) err = %v, want ErrEmptyBody", body, err)
@@ -178,7 +187,7 @@ func TestSaveText_ReplacesExistingFileCoverLetter(t *testing.T) {
 	appID := uuid.New()
 	oldKey := "cover-letters/" + appID.String() + "/old/letter.pdf"
 	repo := &mockRepo{
-		get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			return &CoverLetter{
 				ID:               uuid.New(),
 				ApplicationID:    appID,
@@ -192,7 +201,7 @@ func TestSaveText_ReplacesExistingFileCoverLetter(t *testing.T) {
 	svc := NewService(repo, store)
 
 	if _, err := svc.SaveText(
-		context.Background(),
+		context.Background(), testUserID,
 		SaveTextInput{ApplicationID: appID, BodyText: "typed instead"},
 	); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -239,7 +248,7 @@ func TestSaveFile_AcceptsOnlyPDFDOCXAndDOC(t *testing.T) {
 			svc := NewService(repo, store)
 
 			_, err := svc.SaveFile(
-				context.Background(), SaveFileInput{
+				context.Background(), testUserID, SaveFileInput{
 					ApplicationID: uuid.New(),
 					Filename:      tc.filename,
 					Content:       []byte("%PDF pretend"),
@@ -263,7 +272,7 @@ func TestSaveFile_AcceptsOnlyPDFDOCXAndDOC(t *testing.T) {
 
 func TestSaveFile_RejectsBadFormatBeforeTouchingTheExistingRow(t *testing.T) {
 	repo := &mockRepo{
-		get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			t.Fatal("validation must run before the existing cover letter is looked up")
 			return nil, nil
 		},
@@ -271,7 +280,7 @@ func TestSaveFile_RejectsBadFormatBeforeTouchingTheExistingRow(t *testing.T) {
 	svc := NewService(repo, &mockStorage{})
 
 	if _, err := svc.SaveFile(
-		context.Background(), SaveFileInput{
+		context.Background(), testUserID, SaveFileInput{
 			ApplicationID: uuid.New(),
 			Filename:      "notes.txt",
 			Content:       []byte("x"),
@@ -296,7 +305,7 @@ func TestSaveFile_StoresFileAndRecordsRow(t *testing.T) {
 	svc := NewService(repo, store, WithIDGenerator(func() uuid.UUID { return id }))
 
 	got, err := svc.SaveFile(
-		context.Background(), SaveFileInput{
+		context.Background(), testUserID, SaveFileInput{
 			ApplicationID: appID,
 			Filename:      "Cover Letter v2.pdf",
 			Content:       content,
@@ -350,7 +359,7 @@ func TestSaveFile_DerivesContentTypeWhenBrowserSendsNone(t *testing.T) {
 			svc := NewService(&mockRepo{}, store)
 
 			if _, err := svc.SaveFile(
-				context.Background(), SaveFileInput{
+				context.Background(), testUserID, SaveFileInput{
 					ApplicationID: uuid.New(),
 					Filename:      filename,
 					Content:       []byte("bytes"),
@@ -380,7 +389,7 @@ func TestSaveFile_Validation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.in.ApplicationID = uuid.New()
-			if _, err := svc.SaveFile(context.Background(), tc.in); !errors.Is(err, tc.want) {
+			if _, err := svc.SaveFile(context.Background(), testUserID, tc.in); !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
 		})
@@ -393,7 +402,7 @@ func TestSaveFile_StorageFailure_DoesNotCreateRow(t *testing.T) {
 	svc := NewService(repo, &mockStorage{uploadErr: boom})
 
 	if _, err := svc.SaveFile(
-		context.Background(), SaveFileInput{
+		context.Background(), testUserID, SaveFileInput{
 			ApplicationID: uuid.New(),
 			Filename:      "letter.pdf",
 			Content:       []byte("bytes"),
@@ -415,7 +424,7 @@ func TestSaveFile_DatabaseFailure_RemovesOrphanedObject(t *testing.T) {
 	svc := NewService(repo, store)
 
 	if _, err := svc.SaveFile(
-		context.Background(), SaveFileInput{
+		context.Background(), testUserID, SaveFileInput{
 			ApplicationID: uuid.New(),
 			Filename:      "letter.docx",
 			Content:       []byte("bytes"),
@@ -428,8 +437,9 @@ func TestSaveFile_DatabaseFailure_RemovesOrphanedObject(t *testing.T) {
 	}
 }
 
-// The applications module does not exist yet, so the foreign key is what tells
-// us the application id was made up. The error has to survive the rollback.
+// The WHERE EXISTS ownership guard on CreateCoverLetter is what tells us the
+// application id was made up, or belongs to somebody else. The error has to
+// survive the rollback.
 func TestSaveFile_UnknownApplication_IsReportedAsSuch(t *testing.T) {
 	repo := &mockRepo{
 		create: func(context.Context, NewCoverLetter) (*CoverLetter, error) { return nil, ErrApplicationNotFound },
@@ -438,7 +448,7 @@ func TestSaveFile_UnknownApplication_IsReportedAsSuch(t *testing.T) {
 	svc := NewService(repo, store)
 
 	if _, err := svc.SaveFile(
-		context.Background(), SaveFileInput{
+		context.Background(), testUserID, SaveFileInput{
 			ApplicationID: uuid.New(),
 			Filename:      "letter.pdf",
 			Content:       []byte("bytes"),
@@ -459,17 +469,17 @@ func TestEditText_UpdatesTheBodyInPlace(t *testing.T) {
 	appID := uuid.New()
 	var gotBody string
 	repo := &mockRepo{
-		get: func(_ context.Context, id uuid.UUID) (*CoverLetter, error) {
+		get: func(_ context.Context, _, id uuid.UUID) (*CoverLetter, error) {
 			return &CoverLetter{ID: uuid.New(), ApplicationID: id, Kind: KindText, BodyText: ptrString("old")}, nil
 		},
-		updateText: func(_ context.Context, _ uuid.UUID, body string) (*CoverLetter, error) {
+		updateText: func(_ context.Context, _, _ uuid.UUID, body string) (*CoverLetter, error) {
 			gotBody = body
 			return &CoverLetter{ApplicationID: appID, Kind: KindText, BodyText: &body}, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	got, err := svc.EditText(context.Background(), appID, "  rewritten opening paragraph  ")
+	got, err := svc.EditText(context.Background(), testUserID, appID, "  rewritten opening paragraph  ")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -487,7 +497,7 @@ func TestEditText_UpdatesTheBodyInPlace(t *testing.T) {
 
 func TestEditText_FileCoverLetterIsRejected(t *testing.T) {
 	repo := &mockRepo{
-		get: func(_ context.Context, id uuid.UUID) (*CoverLetter, error) {
+		get: func(_ context.Context, _, id uuid.UUID) (*CoverLetter, error) {
 			return &CoverLetter{
 				ID:               uuid.New(),
 				ApplicationID:    id,
@@ -496,7 +506,7 @@ func TestEditText_FileCoverLetterIsRejected(t *testing.T) {
 				OriginalFilename: ptrString("letter.pdf"),
 			}, nil
 		},
-		updateText: func(context.Context, uuid.UUID, string) (*CoverLetter, error) {
+		updateText: func(context.Context, uuid.UUID, uuid.UUID, string) (*CoverLetter, error) {
 			t.Fatal("a file cover letter is immutable — no update may be attempted")
 			return nil, nil
 		},
@@ -504,10 +514,9 @@ func TestEditText_FileCoverLetterIsRejected(t *testing.T) {
 	store := &mockStorage{}
 	svc := NewService(repo, store)
 
-	if _, err := svc.EditText(context.Background(), uuid.New(), "trying to edit a PDF"); !errors.Is(
-		err,
-		ErrNotTextKind,
-	) {
+	if _, err := svc.EditText(
+		context.Background(), testUserID, uuid.New(), "trying to edit a PDF",
+	); !errors.Is(err, ErrNotTextKind) {
 		t.Errorf("err = %v, want ErrNotTextKind", err)
 	}
 	if len(store.deletedKeys) != 0 {
@@ -518,21 +527,25 @@ func TestEditText_FileCoverLetterIsRejected(t *testing.T) {
 func TestEditText_MissingCoverLetterIsNotFound(t *testing.T) {
 	svc := NewService(&mockRepo{}, &mockStorage{}) // default get returns ErrNotFound
 
-	if _, err := svc.EditText(context.Background(), uuid.New(), "text"); !errors.Is(err, ErrNotFound) {
+	if _, err := svc.EditText(
+		context.Background(), testUserID, uuid.New(), "text",
+	); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestEditText_BlankBodyIsRejected(t *testing.T) {
 	repo := &mockRepo{
-		get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			t.Fatal("a blank body should be rejected before any lookup")
 			return nil, nil
 		},
 	}
 	svc := NewService(repo, &mockStorage{})
 
-	if _, err := svc.EditText(context.Background(), uuid.New(), "   "); !errors.Is(err, ErrEmptyBody) {
+	if _, err := svc.EditText(
+		context.Background(), testUserID, uuid.New(), "   ",
+	); !errors.Is(err, ErrEmptyBody) {
 		t.Errorf("err = %v, want ErrEmptyBody", err)
 	}
 }
@@ -546,11 +559,11 @@ func TestGet_ReturnsEitherKind(t *testing.T) {
 
 	t.Run("text", func(t *testing.T) {
 		repo := &mockRepo{
-			get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+			get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 				return &CoverLetter{ApplicationID: appID, Kind: KindText, BodyText: ptrString("Dear team,")}, nil
 			},
 		}
-		got, err := NewService(repo, &mockStorage{}).Get(context.Background(), appID)
+		got, err := NewService(repo, &mockStorage{}).Get(context.Background(), testUserID, appID)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -564,7 +577,7 @@ func TestGet_ReturnsEitherKind(t *testing.T) {
 
 	t.Run("file", func(t *testing.T) {
 		repo := &mockRepo{
-			get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+			get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 				return &CoverLetter{
 					ApplicationID:    appID,
 					Kind:             KindFile,
@@ -573,7 +586,7 @@ func TestGet_ReturnsEitherKind(t *testing.T) {
 				}, nil
 			},
 		}
-		got, err := NewService(repo, &mockStorage{}).Get(context.Background(), appID)
+		got, err := NewService(repo, &mockStorage{}).Get(context.Background(), testUserID, appID)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -588,7 +601,7 @@ func TestGet_ReturnsEitherKind(t *testing.T) {
 
 func TestGet_MissingCoverLetterIsNotFound(t *testing.T) {
 	if _, err := NewService(&mockRepo{}, &mockStorage{}).Get(
-		context.Background(),
+		context.Background(), testUserID,
 		uuid.New(),
 	); !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -597,7 +610,7 @@ func TestGet_MissingCoverLetterIsNotFound(t *testing.T) {
 
 func TestDownloadURL_FileKindReturnsPresignedLink(t *testing.T) {
 	repo := &mockRepo{
-		get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			return &CoverLetter{
 				Kind:             KindFile,
 				S3Key:            ptrString("cover-letters/a/b/letter.pdf"),
@@ -607,7 +620,7 @@ func TestDownloadURL_FileKindReturnsPresignedLink(t *testing.T) {
 	}
 	svc := NewService(repo, &mockStorage{}, WithDownloadTTL(5*time.Minute))
 
-	link, err := svc.DownloadURL(context.Background(), uuid.New())
+	link, err := svc.DownloadURL(context.Background(), testUserID, uuid.New())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -624,12 +637,12 @@ func TestDownloadURL_FileKindReturnsPresignedLink(t *testing.T) {
 
 func TestDownloadURL_TextKindHasNothingToDownload(t *testing.T) {
 	repo := &mockRepo{
-		get: func(context.Context, uuid.UUID) (*CoverLetter, error) {
+		get: func(context.Context, uuid.UUID, uuid.UUID) (*CoverLetter, error) {
 			return &CoverLetter{Kind: KindText, BodyText: ptrString("Dear team,")}, nil
 		},
 	}
 	if _, err := NewService(repo, &mockStorage{}).DownloadURL(
-		context.Background(),
+		context.Background(), testUserID,
 		uuid.New(),
 	); !errors.Is(err, ErrNotFileKind) {
 		t.Errorf("err = %v, want ErrNotFileKind", err)

@@ -248,6 +248,30 @@ func TestHandlerRegister_SetsSessionCookieAndReturnsUser(t *testing.T) {
 	}
 }
 
+// The cookie must outlive the session it points at, because the session's
+// expiry slides forward in the database and a pinned cookie does not follow it.
+// A cookie stamped with the expiry the session had at login logs out a daily
+// user on day 30 with a live row still sitting in the table.
+func TestHandlerRegister_CookieOutlivesTheSessionExpiry(t *testing.T) {
+	mux := newTestServer(&mockService{}, staticUser(uuid.New()))
+
+	rec := do(
+		t, mux,
+		jsonRequest(http.MethodPost, "/auth/register", `{"email":"a@b.com","password":"correct-horse-battery"}`),
+	)
+
+	cookie := cookieNamed(t, rec, SessionCookieName)
+	if cookie.MaxAge <= int(DefaultSessionTTL/time.Second) {
+		t.Errorf(
+			"MaxAge = %d, want more than the %d-second session TTL so the database stays the sole authority on expiry",
+			cookie.MaxAge, int(DefaultSessionTTL/time.Second),
+		)
+	}
+	if !cookie.Expires.IsZero() {
+		t.Error("Expires must not be set alongside MaxAge — the mock session's expiry is not the cookie's lifetime")
+	}
+}
+
 // The domain user carries a password hash and the response type must not.
 func TestHandlerRegister_ResponseNeverCarriesThePasswordHash(t *testing.T) {
 	mux := newTestServer(&mockService{}, staticUser(uuid.New()))
@@ -304,6 +328,9 @@ func TestHandlerRegister_ServiceErrorsMapToStatuses(t *testing.T) {
 		{"missing email", ErrEmailRequired, http.StatusBadRequest, "email_required"},
 		{"malformed email", ErrEmailInvalid, http.StatusBadRequest, "email_invalid"},
 		{"short password", ErrPasswordTooShort, http.StatusBadRequest, "password_too_short"},
+		// 400 rather than 500 specifically: this is the error a user earns by
+		// taking "no composition rules, length is what matters" at its word.
+		{"long password", ErrPasswordTooLong, http.StatusBadRequest, "password_too_long"},
 	}
 
 	for _, tc := range cases {

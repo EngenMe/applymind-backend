@@ -14,22 +14,28 @@ import (
 
 const createCV = `-- name: CreateCV :one
 
-INSERT INTO cvs (name, tag)
-VALUES ($1, $2)
+INSERT INTO cvs (user_id, name, tag)
+VALUES ($1, $2, $3)
 RETURNING id, name, tag, created_at, updated_at, user_id
 `
 
 type CreateCVParams struct {
-	Name string  `json:"name"`
-	Tag  *string `json:"tag"`
+	UserID uuid.UUID `json:"user_id"`
+	Name   string    `json:"name"`
+	Tag    *string   `json:"tag"`
 }
 
 // ApplyMind — cvs module queries
 //
 // Note: application status is cast to text so this module does not depend on the
 // generated enum type from the applications module.
+//
+// Phase 15: every statement is scoped by user_id. This matters most for the
+// hash-match path (FindCVVersionByHash) — without the scope, a hash collision
+// could link one user's upload to a CV version another user owns, and the
+// extension would report a match it has no business reporting across accounts.
 func (q *Queries) CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error) {
-	row := q.db.QueryRow(ctx, createCV, arg.Name, arg.Tag)
+	row := q.db.QueryRow(ctx, createCV, arg.UserID, arg.Name, arg.Tag)
 	var i Cv
 	err := row.Scan(
 		&i.ID,
@@ -43,13 +49,14 @@ func (q *Queries) CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error) 
 }
 
 const createCVVersion = `-- name: CreateCVVersion :one
-INSERT INTO cv_versions (id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO cv_versions (id, user_id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id
 `
 
 type CreateCVVersionParams struct {
 	ID               uuid.UUID `json:"id"`
+	UserID           uuid.UUID `json:"user_id"`
 	CvID             uuid.UUID `json:"cv_id"`
 	Sha256Hash       string    `json:"sha256_hash"`
 	FileSizeBytes    int64     `json:"file_size_bytes"`
@@ -60,6 +67,7 @@ type CreateCVVersionParams struct {
 func (q *Queries) CreateCVVersion(ctx context.Context, arg CreateCVVersionParams) (CvVersion, error) {
 	row := q.db.QueryRow(ctx, createCVVersion,
 		arg.ID,
+		arg.UserID,
 		arg.CvID,
 		arg.Sha256Hash,
 		arg.FileSizeBytes,
@@ -81,27 +89,33 @@ func (q *Queries) CreateCVVersion(ctx context.Context, arg CreateCVVersionParams
 }
 
 const deleteCV = `-- name: DeleteCV :exec
-DELETE FROM cvs WHERE id = $1
+DELETE FROM cvs WHERE id = $1 AND user_id = $2
 `
 
-func (q *Queries) DeleteCV(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteCV, id)
+type DeleteCVParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) DeleteCV(ctx context.Context, arg DeleteCVParams) error {
+	_, err := q.db.Exec(ctx, deleteCV, arg.ID, arg.UserID)
 	return err
 }
 
 const findCVVersionByCVAndHash = `-- name: FindCVVersionByCVAndHash :one
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
-WHERE cv_id = $1 AND sha256_hash = $2
+WHERE cv_id = $1 AND user_id = $2 AND sha256_hash = $3
 LIMIT 1
 `
 
 type FindCVVersionByCVAndHashParams struct {
 	CvID       uuid.UUID `json:"cv_id"`
+	UserID     uuid.UUID `json:"user_id"`
 	Sha256Hash string    `json:"sha256_hash"`
 }
 
 func (q *Queries) FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersionByCVAndHashParams) (CvVersion, error) {
-	row := q.db.QueryRow(ctx, findCVVersionByCVAndHash, arg.CvID, arg.Sha256Hash)
+	row := q.db.QueryRow(ctx, findCVVersionByCVAndHash, arg.CvID, arg.UserID, arg.Sha256Hash)
 	var i CvVersion
 	err := row.Scan(
 		&i.ID,
@@ -118,18 +132,19 @@ func (q *Queries) FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersio
 
 const findCVVersionByCVAndSize = `-- name: FindCVVersionByCVAndSize :one
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
-WHERE cv_id = $1 AND file_size_bytes = $2
+WHERE cv_id = $1 AND user_id = $2 AND file_size_bytes = $3
 ORDER BY uploaded_at DESC
 LIMIT 1
 `
 
 type FindCVVersionByCVAndSizeParams struct {
 	CvID          uuid.UUID `json:"cv_id"`
+	UserID        uuid.UUID `json:"user_id"`
 	FileSizeBytes int64     `json:"file_size_bytes"`
 }
 
 func (q *Queries) FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersionByCVAndSizeParams) (CvVersion, error) {
-	row := q.db.QueryRow(ctx, findCVVersionByCVAndSize, arg.CvID, arg.FileSizeBytes)
+	row := q.db.QueryRow(ctx, findCVVersionByCVAndSize, arg.CvID, arg.UserID, arg.FileSizeBytes)
 	var i CvVersion
 	err := row.Scan(
 		&i.ID,
@@ -146,13 +161,18 @@ func (q *Queries) FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersio
 
 const findCVVersionByHash = `-- name: FindCVVersionByHash :one
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
-WHERE sha256_hash = $1
+WHERE user_id = $1 AND sha256_hash = $2
 ORDER BY uploaded_at DESC
 LIMIT 1
 `
 
-func (q *Queries) FindCVVersionByHash(ctx context.Context, sha256Hash string) (CvVersion, error) {
-	row := q.db.QueryRow(ctx, findCVVersionByHash, sha256Hash)
+type FindCVVersionByHashParams struct {
+	UserID     uuid.UUID `json:"user_id"`
+	Sha256Hash string    `json:"sha256_hash"`
+}
+
+func (q *Queries) FindCVVersionByHash(ctx context.Context, arg FindCVVersionByHashParams) (CvVersion, error) {
+	row := q.db.QueryRow(ctx, findCVVersionByHash, arg.UserID, arg.Sha256Hash)
 	var i CvVersion
 	err := row.Scan(
 		&i.ID,
@@ -169,13 +189,18 @@ func (q *Queries) FindCVVersionByHash(ctx context.Context, sha256Hash string) (C
 
 const findLatestCVVersionByFilename = `-- name: FindLatestCVVersionByFilename :one
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
-WHERE original_filename = $1
+WHERE user_id = $1 AND original_filename = $2
 ORDER BY uploaded_at DESC
 LIMIT 1
 `
 
-func (q *Queries) FindLatestCVVersionByFilename(ctx context.Context, originalFilename string) (CvVersion, error) {
-	row := q.db.QueryRow(ctx, findLatestCVVersionByFilename, originalFilename)
+type FindLatestCVVersionByFilenameParams struct {
+	UserID           uuid.UUID `json:"user_id"`
+	OriginalFilename string    `json:"original_filename"`
+}
+
+func (q *Queries) FindLatestCVVersionByFilename(ctx context.Context, arg FindLatestCVVersionByFilenameParams) (CvVersion, error) {
+	row := q.db.QueryRow(ctx, findLatestCVVersionByFilename, arg.UserID, arg.OriginalFilename)
 	var i CvVersion
 	err := row.Scan(
 		&i.ID,
@@ -191,11 +216,16 @@ func (q *Queries) FindLatestCVVersionByFilename(ctx context.Context, originalFil
 }
 
 const getCV = `-- name: GetCV :one
-SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE id = $1
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE id = $1 AND user_id = $2
 `
 
-func (q *Queries) GetCV(ctx context.Context, id uuid.UUID) (Cv, error) {
-	row := q.db.QueryRow(ctx, getCV, id)
+type GetCVParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) GetCV(ctx context.Context, arg GetCVParams) (Cv, error) {
+	row := q.db.QueryRow(ctx, getCV, arg.ID, arg.UserID)
 	var i Cv
 	err := row.Scan(
 		&i.ID,
@@ -209,11 +239,16 @@ func (q *Queries) GetCV(ctx context.Context, id uuid.UUID) (Cv, error) {
 }
 
 const getCVByName = `-- name: GetCVByName :one
-SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE name = $1
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE user_id = $1 AND name = $2
 `
 
-func (q *Queries) GetCVByName(ctx context.Context, name string) (Cv, error) {
-	row := q.db.QueryRow(ctx, getCVByName, name)
+type GetCVByNameParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Name   string    `json:"name"`
+}
+
+func (q *Queries) GetCVByName(ctx context.Context, arg GetCVByNameParams) (Cv, error) {
+	row := q.db.QueryRow(ctx, getCVByName, arg.UserID, arg.Name)
 	var i Cv
 	err := row.Scan(
 		&i.ID,
@@ -227,11 +262,16 @@ func (q *Queries) GetCVByName(ctx context.Context, name string) (Cv, error) {
 }
 
 const getCVVersion = `-- name: GetCVVersion :one
-SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions WHERE id = $1
+SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions WHERE id = $1 AND user_id = $2
 `
 
-func (q *Queries) GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error) {
-	row := q.db.QueryRow(ctx, getCVVersion, id)
+type GetCVVersionParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) GetCVVersion(ctx context.Context, arg GetCVVersionParams) (CvVersion, error) {
+	row := q.db.QueryRow(ctx, getCVVersion, arg.ID, arg.UserID)
 	var i CvVersion
 	err := row.Scan(
 		&i.ID,
@@ -252,18 +292,23 @@ SELECT
     a.applied_at
 FROM applications a
 JOIN cv_versions v ON v.id = a.cv_version_id
-WHERE v.cv_id = $1 AND a.applied_at IS NOT NULL
+WHERE v.cv_id = $1 AND v.user_id = $2 AND a.applied_at IS NOT NULL
 ORDER BY a.applied_at DESC
 LIMIT 1
 `
+
+type GetLastCVUsageParams struct {
+	CvID   uuid.UUID `json:"cv_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
 
 type GetLastCVUsageRow struct {
 	CompanyName string     `json:"company_name"`
 	AppliedAt   *time.Time `json:"applied_at"`
 }
 
-func (q *Queries) GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCVUsageRow, error) {
-	row := q.db.QueryRow(ctx, getLastCVUsage, cvID)
+func (q *Queries) GetLastCVUsage(ctx context.Context, arg GetLastCVUsageParams) (GetLastCVUsageRow, error) {
+	row := q.db.QueryRow(ctx, getLastCVUsage, arg.CvID, arg.UserID)
 	var i GetLastCVUsageRow
 	err := row.Scan(&i.CompanyName, &i.AppliedAt)
 	return i, err
@@ -271,11 +316,12 @@ func (q *Queries) GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCV
 
 const listAllCVVersions = `-- name: ListAllCVVersions :many
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
+WHERE user_id = $1
 ORDER BY cv_id, uploaded_at DESC
 `
 
-func (q *Queries) ListAllCVVersions(ctx context.Context) ([]CvVersion, error) {
-	rows, err := q.db.Query(ctx, listAllCVVersions)
+func (q *Queries) ListAllCVVersions(ctx context.Context, userID uuid.UUID) ([]CvVersion, error) {
+	rows, err := q.db.Query(ctx, listAllCVVersions, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -311,9 +357,14 @@ SELECT
     a.status::text AS status,
     a.applied_at
 FROM applications a
-WHERE a.cv_version_id = $1
+WHERE a.cv_version_id = $1 AND a.user_id = $2
 ORDER BY a.applied_at DESC NULLS LAST
 `
+
+type ListApplicationsUsingCVVersionParams struct {
+	CvVersionID *uuid.UUID `json:"cv_version_id"`
+	UserID      uuid.UUID  `json:"user_id"`
+}
 
 type ListApplicationsUsingCVVersionRow struct {
 	ID          uuid.UUID  `json:"id"`
@@ -323,8 +374,8 @@ type ListApplicationsUsingCVVersionRow struct {
 	AppliedAt   *time.Time `json:"applied_at"`
 }
 
-func (q *Queries) ListApplicationsUsingCVVersion(ctx context.Context, cvVersionID *uuid.UUID) ([]ListApplicationsUsingCVVersionRow, error) {
-	rows, err := q.db.Query(ctx, listApplicationsUsingCVVersion, cvVersionID)
+func (q *Queries) ListApplicationsUsingCVVersion(ctx context.Context, arg ListApplicationsUsingCVVersionParams) ([]ListApplicationsUsingCVVersionRow, error) {
+	rows, err := q.db.Query(ctx, listApplicationsUsingCVVersion, arg.CvVersionID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,11 +401,11 @@ func (q *Queries) ListApplicationsUsingCVVersion(ctx context.Context, cvVersionI
 }
 
 const listCVs = `-- name: ListCVs :many
-SELECT id, name, tag, created_at, updated_at, user_id FROM cvs ORDER BY created_at DESC
+SELECT id, name, tag, created_at, updated_at, user_id FROM cvs WHERE user_id = $1 ORDER BY created_at DESC
 `
 
-func (q *Queries) ListCVs(ctx context.Context) ([]Cv, error) {
-	rows, err := q.db.Query(ctx, listCVs)
+func (q *Queries) ListCVs(ctx context.Context, userID uuid.UUID) ([]Cv, error) {
+	rows, err := q.db.Query(ctx, listCVs, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -382,12 +433,17 @@ func (q *Queries) ListCVs(ctx context.Context) ([]Cv, error) {
 
 const listVersionsForCV = `-- name: ListVersionsForCV :many
 SELECT id, cv_id, sha256_hash, file_size_bytes, original_filename, s3_key, uploaded_at, user_id FROM cv_versions
-WHERE cv_id = $1
+WHERE cv_id = $1 AND user_id = $2
 ORDER BY uploaded_at DESC
 `
 
-func (q *Queries) ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error) {
-	rows, err := q.db.Query(ctx, listVersionsForCV, cvID)
+type ListVersionsForCVParams struct {
+	CvID   uuid.UUID `json:"cv_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) ListVersionsForCV(ctx context.Context, arg ListVersionsForCVParams) ([]CvVersion, error) {
+	rows, err := q.db.Query(ctx, listVersionsForCV, arg.CvID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}

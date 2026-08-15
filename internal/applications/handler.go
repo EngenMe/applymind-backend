@@ -10,12 +10,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/EngenMe/applymind-backend/pkg/middleware"
 )
 
 // Handler exposes the applications module over HTTP via chi, matching the router
-// set up in cmd/api/main.go. Register it inside the API-key-protected group:
+// set up in cmd/api/main.go. Register it inside the authenticated group:
 //
-//	applications.NewHandler(appSvc, logger).RegisterRoutes(protected)
+//	applications.NewHandler(appSvc, logger).RegisterRoutes(authed)
 type Handler struct {
 	svc    Service
 	logger *slog.Logger
@@ -44,6 +46,21 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 // pathParam is the single point of coupling to the router.
 func (h *Handler) pathParam(r *http.Request, name string) string {
 	return chi.URLParam(r, name)
+}
+
+// requireUser reads the authenticated caller. See the identical helper in
+// internal/auth and internal/cvs for why a missing user here is a 500, not a 401.
+func (h *Handler) requireUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		h.logger.ErrorContext(
+			r.Context(), "applications: no user in context on a protected route",
+			slog.String("path", r.URL.Path),
+		)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "something went wrong")
+		return uuid.Nil, false
+	}
+	return userID, true
 }
 
 // ---------------------------------------------------------------------------
@@ -154,13 +171,18 @@ type duplicatePayload struct {
 // back as duplicate_warning — the save still happens, and the caller decides
 // what to tell the user.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	var req createRequest
 	if !h.decode(w, r, &req) {
 		return
 	}
 
 	result, err := h.svc.Create(
-		r.Context(), CreateInput{
+		r.Context(), userID, CreateInput{
 			CompanyName:     req.CompanyName,
 			JobTitle:        req.JobTitle,
 			JobDescription:  req.JobDescription,
@@ -195,6 +217,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 //	status, site_id, cv_version_id, company, q (company or title search),
 //	from, to (RFC3339 or YYYY-MM-DD), limit, offset
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
+
 	q := r.URL.Query()
 	filter := ListFilter{
 		Company: optionalString(q.Get("company")),
@@ -205,23 +232,23 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		status := Status(raw)
 		filter.Status = &status
 	}
-	var ok bool
-	if filter.SiteID, ok = h.optionalUUID(w, q.Get("site_id"), "invalid_site_id"); !ok {
+	var uOK bool
+	if filter.SiteID, uOK = h.optionalUUID(w, q.Get("site_id"), "invalid_site_id"); !uOK {
 		return
 	}
-	if filter.CVVersionID, ok = h.optionalUUID(w, q.Get("cv_version_id"), "invalid_cv_version_id"); !ok {
+	if filter.CVVersionID, uOK = h.optionalUUID(w, q.Get("cv_version_id"), "invalid_cv_version_id"); !uOK {
 		return
 	}
-	if filter.From, ok = h.optionalTime(w, q.Get("from"), "invalid_from"); !ok {
+	if filter.From, uOK = h.optionalTime(w, q.Get("from"), "invalid_from"); !uOK {
 		return
 	}
-	if filter.To, ok = h.optionalTime(w, q.Get("to"), "invalid_to"); !ok {
+	if filter.To, uOK = h.optionalTime(w, q.Get("to"), "invalid_to"); !uOK {
 		return
 	}
 	filter.Limit = atoiOr(q.Get("limit"), 0)
 	filter.Offset = atoiOr(q.Get("offset"), 0)
 
-	apps, err := h.svc.List(r.Context(), filter)
+	apps, err := h.svc.List(r.Context(), userID, filter)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -231,12 +258,16 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 // Get — GET /applications/{id}, with the full status history.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
 	}
 
-	app, err := h.svc.Get(r.Context(), id)
+	app, err := h.svc.Get(r.Context(), userID, id)
 	if err != nil {
 		h.writeServiceError(w, r, err)
 		return
@@ -247,6 +278,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // Update — PUT /applications/{id}
 // Captured job data only; use PATCH .../status to move the status.
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
@@ -257,7 +292,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	app, err := h.svc.Update(
-		r.Context(), id, UpdateInput{
+		r.Context(), userID, id, UpdateInput{
 			CompanyName:    req.CompanyName,
 			JobTitle:       req.JobTitle,
 			JobDescription: req.JobDescription,
@@ -277,6 +312,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 // Body: {"status": "Interviewing", "note": "phone screen booked"}
 // changed_by defaults to "user".
 func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
@@ -287,7 +326,7 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	app, err := h.svc.UpdateStatus(
-		r.Context(), id, StatusUpdateInput{
+		r.Context(), userID, id, StatusUpdateInput{
 			Status:    Status(req.Status),
 			Note:      req.Note,
 			ChangedBy: ChangeSource(req.ChangedBy),
@@ -313,6 +352,10 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 //
 // An application that is already Applied comes back 409 — it has been sent.
 func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
@@ -323,7 +366,7 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.svc.Complete(
-		r.Context(), id, CompleteInput{
+		r.Context(), userID, id, CompleteInput{
 			CVVersionID:     req.CVVersionID,
 			CoverLetterText: req.CoverLetterText,
 			Note:            req.Note,
@@ -346,12 +389,16 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 // Delete — DELETE /applications/{id}
 // Cover letter, status history, reminders and recruiter contact go with it.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.requireUser(w, r)
+	if !ok {
+		return
+	}
 	id, ok := h.parseUUIDParam(w, r, "id")
 	if !ok {
 		return
 	}
 
-	if err := h.svc.Delete(r.Context(), id); err != nil {
+	if err := h.svc.Delete(r.Context(), userID, id); err != nil {
 		h.writeServiceError(w, r, err)
 		return
 	}
@@ -367,14 +414,19 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 // It never blocks anything, and neither does POST /applications, which reports
 // the same warning if the user saves anyway.
 func (h *Handler) CheckDuplicate(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	siteID, ok := h.optionalUUID(w, q.Get("site_id"), "invalid_site_id")
+	userID, ok := h.requireUser(w, r)
 	if !ok {
 		return
 	}
 
+	q := r.URL.Query()
+	siteID, uOK := h.optionalUUID(w, q.Get("site_id"), "invalid_site_id")
+	if !uOK {
+		return
+	}
+
 	warning, err := h.svc.CheckDuplicate(
-		r.Context(), DuplicateQuery{
+		r.Context(), userID, DuplicateQuery{
 			Company:  q.Get("company"),
 			JobTitle: q.Get("title"),
 			SiteID:   siteID,

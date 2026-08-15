@@ -11,19 +11,42 @@ import (
 )
 
 type Querier interface {
+	// A cheap pre-check so the service can tell an unowned/missing cv_version_id
+	// apart from an unowned/missing site_id before either reaches the atomic
+	// INSERT/UPDATE guard, which cannot distinguish the two once it collapses to
+	// "no rows written". This query exists purely for that distinguishable error
+	// message; the INSERT/UPDATE guards remain the actual enforcement against a
+	// race between this check and the write.
+	CVVersionOwnedByUser(ctx context.Context, arg CVVersionOwnedByUserParams) (bool, error)
 	// ---------------------------------------------------------------------------
 	// API tokens
 	// ---------------------------------------------------------------------------
 	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (ApiToken, error)
-	// Queries for the applications module. Run `sqlc generate` after adding this
-	// file; internal/db/sqlc/applications.sql.go and the additions to querier.go are
-	// generated from it.
+	// Queries for the applications module.
+	//
+	// Phase 15: every statement is now scoped by user_id — either as a WHERE clause
+	// on an existing row, or as a column on a new one. The one exception is
+	// ResolveSiteByDomain, which matches a global (user_id IS NULL) site OR one the
+	// caller owns, because a pre-configured site belongs to everyone.
+	// Both WHERE EXISTS clauses are load-bearing, not decorative: site_id and
+	// cv_version_id are foreign keys, and a foreign key only proves the row
+	// exists — it says nothing about who owns it. site_id must be global
+	// (user_id IS NULL) or the caller's own, matching every other site read in
+	// this codebase. cv_version_id is nullable — no CV attached is always fine —
+	// but when it is set, it must belong to this user; skip that check and one
+	// user's application can end up pointing at another user's CV, which is a
+	// worse leak than a rejected save.
 	CreateApplication(ctx context.Context, arg CreateApplicationParams) (Application, error)
 	CreateApplicationStatusHistory(ctx context.Context, arg CreateApplicationStatusHistoryParams) (ApplicationStatusHistory, error)
 	// ApplyMind — cvs module queries
 	//
 	// Note: application status is cast to text so this module does not depend on the
 	// generated enum type from the applications module.
+	//
+	// Phase 15: every statement is scoped by user_id. This matters most for the
+	// hash-match path (FindCVVersionByHash) — without the scope, a hash collision
+	// could link one user's upload to a CV version another user owns, and the
+	// extension would report a match it has no business reporting across accounts.
 	CreateCV(ctx context.Context, arg CreateCVParams) (Cv, error)
 	CreateCVVersion(ctx context.Context, arg CreateCVVersionParams) (CvVersion, error)
 	// Queries for the coverletters module.
@@ -31,17 +54,36 @@ type Querier interface {
 	// cover_letters is one-to-one with applications (unique(application_id)), so
 	// every statement here is keyed by application_id rather than by the row's own
 	// id. There is no history table and nothing to match against.
+	//
+	// Phase 15: every statement adds user_id. This module's routes are mounted
+	// independently of applications' own — nothing upstream of these queries
+	// confirms the caller owns the application_id in the path — so without this
+	// scope, one user could read, edit or overwrite another user's cover letter
+	// simply by guessing or observing an application id.
 	// The id is supplied by the service rather than defaulted, because a file
 	// cover letter's S3 key is derived from it before the row is written.
+	//
+	// The WHERE EXISTS guard is load-bearing, not decorative: cover_letters'
+	// foreign key on application_id only proves that application exists, not that
+	// it belongs to this user. Without this guard, one user's application_id — a
+	// UUID they could observe or guess — would let another user attach a cover
+	// letter to it, because the FK alone has nothing to say about ownership. A
+	// mismatch here reads as "no such application" to the caller, exactly like a
+	// genuinely missing one, so an unauthorized caller learns nothing about
+	// whether the id is real.
 	CreateCoverLetter(ctx context.Context, arg CreateCoverLetterParams) (CoverLetter, error)
 	// uq_follow_up_reminders_one_pending allows a single un-sent, un-dismissed
-	// reminder per application, so a re-save is a no-op rather than an error.
+	// reminder per application, so a re-save is a no-op rather than an error. The
+	// constraint stays scoped by application_id alone (000015's reasoning: an
+	// application already belongs to exactly one user), so user_id here is a
+	// column to fill in, not part of what makes a reminder unique.
 	CreatePendingFollowUpReminder(ctx context.Context, arg CreatePendingFollowUpReminderParams) (FollowUpReminder, error)
 	// ---------------------------------------------------------------------------
 	// Sessions
 	// ---------------------------------------------------------------------------
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
-	// id, created_at and updated_at come from column defaults.
+	// Always owned: a site created through this statement is never global. The
+	// pre-configured list is seeded exclusively through EnsureSite below.
 	CreateSite(ctx context.Context, arg CreateSiteParams) (Site, error)
 	// Queries for the auth module.
 	//
@@ -52,24 +94,33 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	// Cover letters, status history, reminders and recruiter contacts go with it via
 	// ON DELETE CASCADE.
-	DeleteApplication(ctx context.Context, id uuid.UUID) (int64, error)
-	DeleteCV(ctx context.Context, id uuid.UUID) error
+	DeleteApplication(ctx context.Context, arg DeleteApplicationParams) (int64, error)
+	DeleteCV(ctx context.Context, arg DeleteCVParams) error
 	// Used to implement replace-on-save. Deleting a row that is not there is a
 	// no-op, which is what the service relies on.
-	DeleteCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) error
+	DeleteCoverLetterByApplicationID(ctx context.Context, arg DeleteCoverLetterByApplicationIDParams) error
 	// Housekeeping, not authentication: expired rows are already unusable because
 	// every lookup filters them out. This only stops the table growing forever.
 	DeleteExpiredSessions(ctx context.Context) (int64, error)
+	// Owned rows only. The service already refuses to delete a pre-configured
+	// site before this runs (ErrPreconfigured), so in practice this only ever
+	// targets a row with user_id set — but scoping it here too means a caller
+	// can never delete another user's custom site by guessing its id.
 	// Fails with 23503 when applications still reference the site: the foreign key
-	// is ON DELETE RESTRICT. The pre-configured rule is enforced in the service
-	// layer, not here, per the ERD.
-	DeleteSite(ctx context.Context, id uuid.UUID) (int64, error)
+	// is ON DELETE RESTRICT.
+	DeleteSite(ctx context.Context, arg DeleteSiteParams) (int64, error)
 	// Called when an application moves off Applied: the company (or the user) has
-	// moved it on, so there is nothing left to chase.
-	DismissPendingFollowUpReminders(ctx context.Context, applicationID uuid.UUID) error
+	// moved it on, so there is nothing left to chase. user_id is redundant with
+	// application_id ownership already established by the caller, but it costs
+	// nothing to assert here too.
+	DismissPendingFollowUpReminders(ctx context.Context, arg DismissPendingFollowUpRemindersParams) error
 	// Idempotent insert used to seed the pre-configured list on boot. DO NOTHING
 	// means no row is returned when the domain is already registered, which the
 	// repository reads as "nothing to do" rather than an error.
+	//
+	// Unchanged by phase 15: this always writes a global row (user_id defaults to
+	// NULL) and has no caller to scope to — it runs once at boot, before any
+	// request exists.
 	//
 	// The WHERE clause on the conflict target is load-bearing. Migration 000015
 	// replaced the plain unique(domain) with two rescoped constraints — one on
@@ -79,10 +130,6 @@ type Querier interface {
 	// ON CONFLICT (domain) matches no constraint at all and fails at runtime with
 	// 42P10 rather than at generate time.
 	//
-	// This insert leaves user_id to its default of NULL, so the row it writes is a
-	// global one and does fall under that index. Pre-configured sites belong to
-	// nobody by design: every user sees LinkedIn, and only custom sites are owned.
-	//
 	// Note this only guards the domain constraint; name is UNIQUE too, and a
 	// collision there surfaces as 23505.
 	EnsureSite(ctx context.Context, arg EnsureSiteParams) (Site, error)
@@ -90,11 +137,12 @@ type Querier interface {
 	// enough time has passed to be worth a write.
 	ExtendSession(ctx context.Context, arg ExtendSessionParams) (Session, error)
 	// The MVP duplicate check: exact company name, ignoring case and surrounding
-	// whitespace. Embedding similarity is a later phase.
-	FindApplicationsByCompanyName(ctx context.Context, companyName string) ([]Application, error)
+	// whitespace, scoped to the caller — someone else applying to the same company
+	// is not this user's duplicate.
+	FindApplicationsByCompanyName(ctx context.Context, arg FindApplicationsByCompanyNameParams) ([]Application, error)
 	FindCVVersionByCVAndHash(ctx context.Context, arg FindCVVersionByCVAndHashParams) (CvVersion, error)
 	FindCVVersionByCVAndSize(ctx context.Context, arg FindCVVersionByCVAndSizeParams) (CvVersion, error)
-	FindCVVersionByHash(ctx context.Context, sha256Hash string) (CvVersion, error)
+	FindCVVersionByHash(ctx context.Context, arg FindCVVersionByHashParams) (CvVersion, error)
 	// Queries for the notifications module. Reminder *creation* and *dismissal* stay
 	// in queries/applications.sql: they happen during a save or a status change,
 	// inside that module's transaction.
@@ -106,8 +154,15 @@ type Querier interface {
 	// true is the dashboard poll, which still wants a reminder the sweep already
 	// dispatched this morning.
 	//
+	// Phase 15: @user_id is nullable, on purpose. The scheduler has no request, no
+	// caller, no single user to scope to — its sweep runs for everyone in one pass,
+	// so it passes NULL and every user's due reminders come back together. The
+	// dashboard's GET /notifications/due has a real caller and passes their id, so
+	// it only ever sees its own. Both are "the same query", just with the filter
+	// turned off for the one caller that legitimately has no single user in mind.
+	//
 	FindDueFollowUpReminders(ctx context.Context, arg FindDueFollowUpRemindersParams) ([]FindDueFollowUpRemindersRow, error)
-	FindLatestCVVersionByFilename(ctx context.Context, originalFilename string) (CvVersion, error)
+	FindLatestCVVersionByFilename(ctx context.Context, arg FindLatestCVVersionByFilenameParams) (CvVersion, error)
 	// No expiry column: an API token lives until it is revoked. That is deliberate
 	// — the extension cannot prompt for a re-login, so a token that silently
 	// expired would look like the extension breaking.
@@ -116,17 +171,24 @@ type Querier interface {
 	// revocation are filtered here rather than in Go so that a stale row can never
 	// be authenticated by a caller that forgot to check.
 	FindLiveSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
-	GetApplication(ctx context.Context, id uuid.UUID) (Application, error)
-	GetCV(ctx context.Context, id uuid.UUID) (Cv, error)
-	GetCVByName(ctx context.Context, name string) (Cv, error)
-	GetCVVersion(ctx context.Context, id uuid.UUID) (CvVersion, error)
-	GetCoverLetterByApplicationID(ctx context.Context, applicationID uuid.UUID) (CoverLetter, error)
-	GetLastCVUsage(ctx context.Context, cvID uuid.UUID) (GetLastCVUsageRow, error)
+	// Validates a client-supplied site_id before it is trusted: global (user_id IS
+	// NULL) or the caller's own. Without this, resolveSiteID would accept any
+	// site_id the caller sent — including one belonging to somebody else — since
+	// the column only exists to be trusted, not verified, once it reaches the
+	// insert. Mirrors ResolveSiteByDomain's same-scope reasoning, keyed by id
+	// instead of domain.
+	FindSiteByID(ctx context.Context, arg FindSiteByIDParams) (Site, error)
+	GetApplication(ctx context.Context, arg GetApplicationParams) (Application, error)
+	GetCV(ctx context.Context, arg GetCVParams) (Cv, error)
+	GetCVByName(ctx context.Context, arg GetCVByNameParams) (Cv, error)
+	GetCVVersion(ctx context.Context, arg GetCVVersionParams) (CvVersion, error)
+	GetCoverLetterByApplicationID(ctx context.Context, arg GetCoverLetterByApplicationIDParams) (CoverLetter, error)
+	GetLastCVUsage(ctx context.Context, arg GetLastCVUsageParams) (GetLastCVUsageRow, error)
 	GetSettings(ctx context.Context) (Setting, error)
-	GetSite(ctx context.Context, id uuid.UUID) (Site, error)
-	// Resolves a captured page's domain to a site row. Returns pgx.ErrNoRows when
-	// the domain is not a configured site.
-	GetSiteByDomain(ctx context.Context, domain string) (Site, error)
+	GetSite(ctx context.Context, arg GetSiteParams) (Site, error)
+	// Resolves a captured page's domain to a site row, global or the caller's own.
+	// Returns pgx.ErrNoRows when the domain is not a configured site for this user.
+	GetSiteByDomain(ctx context.Context, arg GetSiteByDomainParams) (Site, error)
 	GetUser(ctx context.Context, id uuid.UUID) (User, error)
 	// email is citext, so this is already case-insensitive at the database level.
 	// The service normalises anyway, so the two never disagree about what "the same
@@ -134,20 +196,27 @@ type Querier interface {
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	ListActiveAPITokens(ctx context.Context, userID uuid.UUID) ([]ApiToken, error)
 	ListActiveSessions(ctx context.Context, userID uuid.UUID) ([]Session, error)
-	// Returns every site the extension is currently allowed to capture from.
-	ListActiveSites(ctx context.Context) ([]Site, error)
-	ListAllCVVersions(ctx context.Context) ([]CvVersion, error)
-	ListApplicationStatusHistory(ctx context.Context, applicationID uuid.UUID) ([]ApplicationStatusHistory, error)
+	// Phase 15: every read is scoped to "global (user_id IS NULL) or mine" — a
+	// pre-configured site belongs to everyone, a custom one belongs to whoever
+	// added it. Writes that create or remove a row are scoped to the caller alone;
+	// EnsureSite is the one exception, since it only ever writes global rows at
+	// boot and has no caller to scope to.
+	// Returns every site the extension is currently allowed to capture from —
+	// the pre-configured list plus this user's own active custom sites.
+	ListActiveSites(ctx context.Context, userID uuid.UUID) ([]Site, error)
+	ListAllCVVersions(ctx context.Context, userID uuid.UUID) ([]CvVersion, error)
+	ListApplicationStatusHistory(ctx context.Context, arg ListApplicationStatusHistoryParams) ([]ApplicationStatusHistory, error)
 	// Every filter is optional: a NULL parameter disables that clause. Ordering and
 	// date filtering both use the effective date — applied_at when set, created_at
 	// otherwise — so a Saved application is never invisible to a date range.
 	ListApplications(ctx context.Context, arg ListApplicationsParams) ([]Application, error)
-	ListApplicationsUsingCVVersion(ctx context.Context, cvVersionID *uuid.UUID) ([]ListApplicationsUsingCVVersionRow, error)
-	ListCVs(ctx context.Context) ([]Cv, error)
-	// Every site, active or not. Backs the dashboard settings page, which has to
-	// show the deactivated ones in order to switch them back on.
-	ListSites(ctx context.Context) ([]Site, error)
-	ListVersionsForCV(ctx context.Context, cvID uuid.UUID) ([]CvVersion, error)
+	ListApplicationsUsingCVVersion(ctx context.Context, arg ListApplicationsUsingCVVersionParams) ([]ListApplicationsUsingCVVersionRow, error)
+	ListCVs(ctx context.Context, userID uuid.UUID) ([]Cv, error)
+	// Every site this user can see, active or not: the pre-configured list plus
+	// their own custom sites. Backs the dashboard settings page, which has to show
+	// the deactivated ones in order to switch them back on.
+	ListSites(ctx context.Context, userID uuid.UUID) ([]Site, error)
+	ListVersionsForCV(ctx context.Context, arg ListVersionsForCVParams) ([]CvVersion, error)
 	// MarkFollowUpReminderSent is flow 4 step 9, minus the resend_email_id
 	// assignment: no such column exists in migration 000008 or the ERD, and no
 	// email is sent in the MVP.
@@ -155,15 +224,21 @@ type Querier interface {
 	// The sent_at IS NULL guard makes this idempotent — a concurrent or repeated
 	// run updates nothing and returns no row rather than moving the timestamp.
 	//
+	// Unscoped by user on purpose: the sweep already resolved which reminder to
+	// mark via FindDueFollowUpReminders (NULL user_id, everyone's), and by the
+	// time this runs the reminder id is trusted, not caller-supplied.
+	//
 	MarkFollowUpReminderSent(ctx context.Context, arg MarkFollowUpReminderSentParams) (FollowUpReminder, error)
 	// Turns a job URL host into a site_id when the client did not send one.
-	// NOTE: if queries/sites.sql already defines an equivalent lookup, delete this
-	// one and point the repository at that generated method instead — two queries
-	// with the same name in the same package will not compile.
+	//
+	// Matches a global site (user_id IS NULL — the pre-configured list every user
+	// sees) or one the caller registered themselves. Without the second half of
+	// that OR, a user's own custom site could never be resolved from a job URL,
+	// only from an explicit site_id.
 	//
 	// The service passes a lowercased, www-stripped host, so the stored value is
 	// normalised the same way here: "www.LinkedIn.com" and "linkedin.com" both match.
-	ResolveSiteByDomain(ctx context.Context, domain string) (Site, error)
+	ResolveSiteByDomain(ctx context.Context, arg ResolveSiteByDomainParams) (Site, error)
 	RevokeAPIToken(ctx context.Context, arg RevokeAPITokenParams) (int64, error)
 	// "Sign out everywhere". Also the correct response to a password change.
 	RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) (int64, error)
@@ -172,21 +247,14 @@ type Querier interface {
 	RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error)
 	// Logout. The caller presents a token rather than an id.
 	RevokeSessionByTokenHash(ctx context.Context, tokenHash string) (int64, error)
-	// ---------------------------------------------------------------------------
-	// PASTE THE QUERY BELOW INTO queries/applications.sql, THEN RUN sqlc generate.
-	//
-	// This file is not a queries file of its own -- it exists only because
-	// queries/applications.sql was not part of the phase upload. Delete it once the
-	// query has been moved across.
-	//
-	// If applications.sql keeps updated_at current with a trigger rather than in
-	// each statement, drop the `updated_at = now()` line to match the other writes
-	// in that file.
-	// ---------------------------------------------------------------------------
 	// Writes the GPT-4o-mini job-match score. Called inside the same transaction as
 	// CreateApplication (Flow 1 step 23), and available on its own as the retry path
 	// for an application saved while scoring was unavailable.
 	SetApplicationAIScore(ctx context.Context, arg SetApplicationAIScoreParams) (Application, error)
+	// Global-or-mine, matching every other read here: a global row can be
+	// deactivated by any user (the ERD's own rule — "pre-configured rows can only
+	// be deactivated" carries no per-user override, so this remains one shared
+	// switch, same as before phase 15), and a custom row only by its owner.
 	// updated_at is maintained by trg_sites_updated_at.
 	SetSiteActive(ctx context.Context, arg SetSiteActiveParams) (Site, error)
 	// Best-effort, called after a successful match. A failure here must never fail
@@ -194,6 +262,10 @@ type Querier interface {
 	TouchAPIToken(ctx context.Context, id uuid.UUID) error
 	// Captured job data only. Status never moves here — that is
 	// UpdateApplicationStatus, so no transition can skip the audit trail.
+	//
+	// Same ownership guards as CreateApplication, for the same reason: this is
+	// also the query Complete uses to attach a CV version (Flow 2), so the check
+	// has to live here too, not only on the insert path.
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (Application, error)
 	// applied_at is write-once: COALESCE keeps the original timestamp if the
 	// application has already been applied to, so bouncing through statuses later

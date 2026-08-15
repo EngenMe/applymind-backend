@@ -129,8 +129,12 @@ type DownloadLink struct {
 }
 
 // NewVersion is the repository-level input for inserting a version row.
+//
+// UserID is set by the service from the authenticated caller — never from
+// client input — and is what CreateVersion writes onto cv_versions.user_id.
 type NewVersion struct {
 	ID               uuid.UUID
+	UserID           uuid.UUID
 	CVID             uuid.UUID
 	SHA256Hash       string
 	FileSizeBytes    int64

@@ -21,10 +21,21 @@ import (
 // only adds what AI scoring introduced — the new repository method, a wrapper
 // that can make it fail, and fakes for the two scoring dependencies — so the
 // existing test file did not have to change.
+//
+// CVVersionOwnedByUser is added here too, defaulting to true (owned). It is a
+// phase 15 addition unrelated to scoring, but every Create call in this file
+// now passes through checkCVVersionOwnership regardless of whether the test
+// cares about CV versions, so fakeRepo has to answer it one way or the other —
+// none of these tests supply a CVVersionID, so it is never actually exercised,
+// only satisfied.
 // ---------------------------------------------------------------------------
 
+func (f *fakeRepo) CVVersionOwnedByUser(_ context.Context, _ uuid.UUID, _ uuid.UUID) (bool, error) {
+	return true, nil
+}
+
 // SetAIScore completes fakeRepo's Repository implementation.
-func (f *fakeRepo) SetAIScore(_ context.Context, id uuid.UUID, score float64, explanation *string) (
+func (f *fakeRepo) SetAIScore(_ context.Context, _ uuid.UUID, id uuid.UUID, score float64, explanation *string) (
 	*Application,
 	error,
 ) {
@@ -61,7 +72,7 @@ func (r *scoringRepo) Tx(ctx context.Context, fn func(Repository) error) error {
 	return fn(r)
 }
 
-func (r *scoringRepo) SetAIScore(ctx context.Context, id uuid.UUID, score float64, explanation *string) (
+func (r *scoringRepo) SetAIScore(ctx context.Context, userID, id uuid.UUID, score float64, explanation *string) (
 	*Application,
 	error,
 ) {
@@ -69,7 +80,7 @@ func (r *scoringRepo) SetAIScore(ctx context.Context, id uuid.UUID, score float6
 	if r.setErr != nil {
 		return nil, r.setErr
 	}
-	return r.fakeRepo.SetAIScore(ctx, id, score, explanation)
+	return r.fakeRepo.SetAIScore(ctx, userID, id, score, explanation)
 }
 
 type fakeScorer struct {
@@ -148,7 +159,7 @@ func scoredOK() *fakeScorer {
 func TestCreateStoresAIScore(t *testing.T) {
 	repo, svc := newScoringService(t, scoredOK(), &fakeProfiles{summary: testProfileSummary})
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -179,7 +190,7 @@ func TestCreateScoresAgainstTheProfileAndTheJob(t *testing.T) {
 	profiles := &fakeProfiles{summary: testProfileSummary}
 	_, svc := newScoringService(t, scorer, profiles)
 
-	if _, err := svc.Create(context.Background(), validInput()); err != nil {
+	if _, err := svc.Create(context.Background(), testUserID, validInput()); err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
 
@@ -212,7 +223,7 @@ func TestCreateStoresAScoreWithNoExplanation(t *testing.T) {
 		&fakeProfiles{summary: testProfileSummary},
 	)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	if err != nil {
 		t.Fatalf("Create: unexpected error: %v", err)
 	}
@@ -252,7 +263,7 @@ func TestCreateSucceedsWhenTheModelFails(t *testing.T) {
 	scorer := &fakeScorer{err: errors.New("openai returned 429")}
 	repo, svc := newScoringService(t, scorer, &fakeProfiles{summary: testProfileSummary})
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	if scorer.calls != 1 {
@@ -271,7 +282,7 @@ func TestCreateSucceedsWhenScoringTimesOut(t *testing.T) {
 	)
 
 	start := time.Now()
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -283,7 +294,7 @@ func TestCreateSkipsScoringWithoutAProfileSummary(t *testing.T) {
 	scorer := scoredOK()
 	repo, svc := newScoringService(t, scorer, &fakeProfiles{summary: "   "})
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	// The point of skipping: a job scored against no profile would produce a
@@ -297,7 +308,7 @@ func TestCreateSkipsScoringWhenTheProfileCannotBeRead(t *testing.T) {
 	scorer := scoredOK()
 	repo, svc := newScoringService(t, scorer, &fakeProfiles{err: errors.New("connection refused")})
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	if scorer.calls != 0 {
@@ -312,7 +323,7 @@ func TestCreateSkipsScoringWithoutAJobDescription(t *testing.T) {
 	in := validInput()
 	in.JobDescription = "   "
 
-	result, err := svc.Create(context.Background(), in)
+	result, err := svc.Create(context.Background(), testUserID, in)
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	if scorer.calls != 0 {
@@ -325,7 +336,7 @@ func TestCreateWithoutScoringConfigured(t *testing.T) {
 	// which is the shape newTestService already has.
 	repo, _, svc := newTestService(t)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo, result, err)
 }
 
@@ -335,7 +346,7 @@ func TestCreateHalfConfiguredScoringStaysOff(t *testing.T) {
 	scorer := scoredOK()
 	repo, svc := newScoringService(t, scorer, nil)
 
-	result, err := svc.Create(context.Background(), validInput())
+	result, err := svc.Create(context.Background(), testUserID, validInput())
 	assertSavedUnscored(t, repo.fakeRepo, result, err)
 
 	if scorer.calls != 0 {
@@ -351,7 +362,7 @@ func TestCreateFailsWhenTheScoreCannotBeWritten(t *testing.T) {
 	repo, svc := newScoringService(t, scoredOK(), &fakeProfiles{summary: testProfileSummary})
 	repo.setErr = errors.New("deadlock detected")
 
-	if _, err := svc.Create(context.Background(), validInput()); err == nil {
+	if _, err := svc.Create(context.Background(), testUserID, validInput()); err == nil {
 		t.Fatal("Create: a failed write inside the transaction must fail the save")
 	}
 	// The real repository rolls the whole transaction back here. The fake has no

@@ -17,15 +17,20 @@ import (
 // absent, because the caller asked for something specific. There is no Find*
 // here — this module has no decision tree, so "no row" is never a normal
 // branch, only "this application has no cover letter yet".
+//
+// Phase 15: every method takes a userID and every query is scoped by it. This
+// module's routes are mounted independently of the applications module's own,
+// so nothing upstream of here confirms the caller owns application_id — this
+// is the only place that check happens.
 type Repository interface {
 	Create(ctx context.Context, in NewCoverLetter) (*CoverLetter, error)
-	GetByApplicationID(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error)
+	GetByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) (*CoverLetter, error)
 	// UpdateTextBody only touches rows with kind = 'text'; the check constraint
 	// on cover_letters would reject a body_text on a file row anyway.
-	UpdateTextBody(ctx context.Context, applicationID uuid.UUID, body string) (*CoverLetter, error)
+	UpdateTextBody(ctx context.Context, userID, applicationID uuid.UUID, body string) (*CoverLetter, error)
 	// DeleteByApplicationID is how a replace is performed. Deleting a row that
 	// does not exist is not an error.
-	DeleteByApplicationID(ctx context.Context, applicationID uuid.UUID) error
+	DeleteByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) error
 }
 
 // postgresRepository is the sqlc-backed implementation.
@@ -53,6 +58,7 @@ func (r *postgresRepository) Create(ctx context.Context, in NewCoverLetter) (*Co
 		ctx, sqlcdb.CreateCoverLetterParams{
 			ID:               in.ID,
 			ApplicationID:    in.ApplicationID,
+			UserID:           in.UserID,
 			Kind:             sqlcdb.CoverLetterKind(in.Kind),
 			BodyText:         in.BodyText,
 			S3Key:            in.S3Key,
@@ -60,14 +66,32 @@ func (r *postgresRepository) Create(ctx context.Context, in NewCoverLetter) (*Co
 		},
 	)
 	if err != nil {
+		// The WHERE EXISTS ownership guard in CreateCoverLetter (see
+		// queries/cover_letters.sql) makes an application_id that does not
+		// exist, or belongs to somebody else, fail identically: pgx.ErrNoRows,
+		// not a constraint violation. translateWriteError alone would not
+		// catch that, so it is handled first — and mapped to the same error a
+		// genuinely missing application already produced via the foreign key,
+		// which is exactly the point: the two cases must read the same.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrApplicationNotFound
+		}
 		return nil, translateWriteError(err)
 	}
 	cl := toDomain(row)
 	return &cl, nil
 }
 
-func (r *postgresRepository) GetByApplicationID(ctx context.Context, applicationID uuid.UUID) (*CoverLetter, error) {
-	row, err := r.q.GetCoverLetterByApplicationID(ctx, applicationID)
+func (r *postgresRepository) GetByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) (
+	*CoverLetter,
+	error,
+) {
+	row, err := r.q.GetCoverLetterByApplicationID(
+		ctx, sqlcdb.GetCoverLetterByApplicationIDParams{
+			ApplicationID: applicationID,
+			UserID:        userID,
+		},
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -78,7 +102,7 @@ func (r *postgresRepository) GetByApplicationID(ctx context.Context, application
 	return &cl, nil
 }
 
-func (r *postgresRepository) UpdateTextBody(ctx context.Context, applicationID uuid.UUID, body string) (
+func (r *postgresRepository) UpdateTextBody(ctx context.Context, userID, applicationID uuid.UUID, body string) (
 	*CoverLetter,
 	error,
 ) {
@@ -86,12 +110,15 @@ func (r *postgresRepository) UpdateTextBody(ctx context.Context, applicationID u
 		ctx, sqlcdb.UpdateCoverLetterTextParams{
 			ApplicationID: applicationID,
 			BodyText:      &body,
+			UserID:        userID,
 		},
 	)
 	if err != nil {
 		// The statement is scoped to kind = 'text', so no rows here means either
-		// no cover letter or a file one. The service checks the kind before
-		// calling, so ErrNotFound is the accurate reading of a race.
+		// no cover letter, a file one, or one belonging to somebody else. The
+		// service checks the kind before calling, so ErrNotFound is the
+		// accurate reading of a race — and the accurate reading for someone
+		// else's row too, since this caller should not learn it exists at all.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -101,8 +128,13 @@ func (r *postgresRepository) UpdateTextBody(ctx context.Context, applicationID u
 	return &cl, nil
 }
 
-func (r *postgresRepository) DeleteByApplicationID(ctx context.Context, applicationID uuid.UUID) error {
-	return r.q.DeleteCoverLetterByApplicationID(ctx, applicationID)
+func (r *postgresRepository) DeleteByApplicationID(ctx context.Context, userID, applicationID uuid.UUID) error {
+	return r.q.DeleteCoverLetterByApplicationID(
+		ctx, sqlcdb.DeleteCoverLetterByApplicationIDParams{
+			ApplicationID: applicationID,
+			UserID:        userID,
+		},
+	)
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@
 -- Phase 15: every row this script writes now carries user_id, resolved once at
 -- the top from the demo account's email (migration 000016 seeds that account).
 -- If that account does not exist yet, this script fails fast on the SELECT
--- INTO STRICT below rather than silently inserting rows with a NULL user_id
+-- INTO STRICT below rather than silently inserting rowgis with a NULL user_id
 -- that the NOT NULL constraint would reject anyway, but with a much less
 -- useful error.
 --

@@ -164,8 +164,9 @@ func NewApplymindStack(scope constructs.Construct, id string, props *awscdk.Stac
 
 	api := awsapigateway.NewLambdaRestApi(
 		stack, jsii.String("Api"), &awsapigateway.LambdaRestApiProps{
-			Handler: apiFunction,
-			Proxy:   jsii.Bool(true),
+			Handler:          apiFunction,
+			Proxy:            jsii.Bool(true),
+			BinaryMediaTypes: jsii.Strings("multipart/form-data"),
 			EndpointConfiguration: &awsapigateway.EndpointConfiguration{
 				Types: &[]awsapigateway.EndpointType{awsapigateway.EndpointType_REGIONAL},
 			},
